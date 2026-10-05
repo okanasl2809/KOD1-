@@ -4,8 +4,12 @@
 // "DİKKAT" alarmı veren durumlar:
 //   1) VOLATİLİTE SIKIŞMASI (dalgalık endeksi) → Bollinger bant genişliği son N barın
 //        en dar %X'ine düştüğünde "SIKIŞMA başladı", tekrar genişleyince "SIKIŞMA bozuldu (hareket başlıyor)"
-//   2) OBV TREND OLUŞUMU → altta destek ya da üstte direnç çizgisi yeni çizildiğinde
-//   3) OBV UYUMSUZLUK → fiyat ile OBV arasında boğa/ayı uyumsuzluğu oluştuğunda
+//        Bozulmanın yönü: kapanış Bollinger ortasının üstündeyse YUKARI, altındaysa AŞAĞI.
+//   2) OBV TREND ÇİZGİSİ → altta destek ya da üstte direnç çizgisi yeni oluştuğunda
+//   3) OBV TREND KIRILIMI → OBV direnç çizgisini yukarı (boğa) ya da destek çizgisini aşağı (ayı) kırdığında
+//   4) OBV UYUMSUZLUK → fiyat ile OBV arasında boğa/ayı uyumsuzluğu oluştuğunda
+//        NOT: uyumsuzluk pivot onayı nedeniyle "Pivot Point Period" kadar bar gecikmeli tespit edilir.
+//        Etiket olayın olduğu bara (geriye) çizilir, alarm ise tespit edildiği barda gelir.
 
 //@version=4
 study("OBV Trend + Uyumsuzluk + Volatilite Sıkışması DİKKAT Alarmı", overlay=false, max_bars_back = 4000)
@@ -30,7 +34,7 @@ sqWindow   = input(defval = 10,  title = "Birleşim penceresi (bar) - uyumsuzluk
 
 Rsi = rsi(Src, rsilen)
 Cci = cci(Src, ccilen)
-Mom = cci(Src, momlen)
+Mom = mom(Src, momlen)
 src = indi == 'RSI' ? Rsi :
    indi == 'CCI' ? Cci :
    indi == 'Momentum' ? Mom :
@@ -88,10 +92,29 @@ gethipos(l1, l2)=>
     _ret2 = l2 == 1 ? t1pos : l2 == 2 ? t2pos : l2 ==3 ? t3pos :  0
     [_ret1, _ret2]
 
+// ---- Bir önceki barın EN GÜNCEL destek/direnç çizgisi (kırılım tespiti için) ----
+// Çizgi: başlangıç barı (bar0), o bardaki değer (val0) ve bar başına eğim (slope).
+var float loSlope = na, var float loVal0 = na, var int loBar0 = na
+var float hiSlope = na, var float hiVal0 = na, var int hiBar0 = na
+
+// Önceki barda geçerli olan çizginin bu bardaki değeri. Çizgi önceki bara kadar hiç
+// kesilmemişti; bu barda geçilirse ilk kırılım budur.
+loProj  = loVal0 + loSlope * (bar_index - loBar0)
+hiProj  = hiVal0 + hiSlope * (bar_index - hiBar0)
+loBreak = not na(loProj) and src < loProj      // destek aşağı kırıldı → AYI
+hiBreak = not na(hiProj) and src > hiProj      // direnç yukarı kırıldı → BOĞA
+
 var line l1 = na, var line l2 = na, var line l3 = na
 var line t1 = na, var line t2 = na, var line t3 = na
 line.delete(l1), line.delete(l2), line.delete(l3)
 line.delete(t1), line.delete(t2), line.delete(t3)
+
+loSlope := na
+loVal0  := na
+loBar0  := na
+hiSlope := na
+hiVal0  := na
+hiBar0  := na
 
 countlinelo = 0
 countlinehi = 0
@@ -100,6 +123,7 @@ for p1 = 1 to PPnum - 1
     uv2 = 0.0
     up1 = 0
     up2 = 0
+    ud  = 0.0
     for p2 = PPnum to p1 + 1
         [val1, val2] = getloval(p1, p2)
         [pos1, pos2] = getlopos(p1, p2)
@@ -112,19 +136,22 @@ for p1 = 1 to PPnum - 1
             for x = pos2 + 1 - prd to bar_index
                 if nz(src[getloc(x + prd)]) < hline
                     valid := false
+                    break
                 lloc := x
                 lval := hline
                 hline := hline + diff
             if valid
-                uv1 := hline
+                uv1 := lval          // çizginin son bardaki değeri (hline bir adım ileriyi gösterir)
                 uv2 := val2
                 up1 := lloc
                 up2 := pos2
+                ud  := diff
                 break
     dv1 = 0.0
     dv2 = 0.0
     dp1 = 0
     dp2 = 0
+    dd  = 0.0
     for p2 = PPnum to p1 + 1
         [val1, val2] = gethival(p1, p2)
         [pos1, pos2] = gethipos(p1, p2)
@@ -142,10 +169,11 @@ for p1 = 1 to PPnum - 1
                 lval := hline
                 hline := hline - diff
             if valid
-                dv1 := hline
+                dv1 := lval
                 dv2 := val2
                 dp1 := lloc
                 dp2 := pos2
+                dd  := diff
                 break
 
     if up1 != 0 and up2 != 0
@@ -153,12 +181,20 @@ for p1 = 1 to PPnum - 1
         l1 := countlinelo == 1 ? line.new(up2 - prd, uv2, up1, uv1) : l1
         l2 := countlinelo == 2 ? line.new(up2 - prd, uv2, up1, uv1) : l2
         l3 := countlinelo == 3 ? line.new(up2 - prd, uv2, up1, uv1) : l3
+        if countlinelo == 1                  // en güncel destek çizgisini sakla
+            loBar0  := up2 - prd
+            loVal0  := uv2
+            loSlope := ud
 
     if dp1 != 0 and dp2 != 0
         countlinehi := countlinehi + 1
         t1 := countlinehi == 1 ? line.new(dp2 - prd, dv2, dp1, dv1) : t1
         t2 := countlinehi == 2 ? line.new(dp2 - prd, dv2, dp1, dv1) : t2
         t3 := countlinehi == 3 ? line.new(dp2 - prd, dv2, dp1, dv1) : t3
+        if countlinehi == 1                  // en güncel direnç çizgisini sakla
+            hiBar0  := dp2 - prd
+            hiVal0  := dv2
+            hiSlope := -dd
 
 // ============================================================
 //   1) VOLATİLİTE SIKIŞMASI (dalgalık endeksi — beraber yaptığımız)
@@ -172,18 +208,22 @@ squeeze = bbwRank < sqPct                                   // volatilite sıkı
 
 squeezeStart = squeeze and not squeeze[1]                   // SIKIŞMA BAŞLADI (izle)
 squeezeFire  = not squeeze and squeeze[1]                   // SIKIŞMA BOZULDU (hareket başlıyor)
+fireUp = squeezeFire and close > basis                      // bozulma yukarı yönlü
+fireDn = squeezeFire and close <= basis                     // bozulma aşağı yönlü
 
 // Sıkışma süresince arka planı sarı boya (eski sistemdeki gibi)
 bgcolor(squeeze ? color.new(color.yellow, 85) : na, title="Sıkışma bölgesi")
-plotshape(squeezeFire, title="Sıkışma bozuldu", text="PATLAMA", style=shape.flag, location=location.bottom, color=color.orange, textcolor=color.orange, size=size.tiny)
+plotshape(fireUp, title="Sıkışma bozuldu YUKARI", text="PATLAMA▲", style=shape.flag, location=location.bottom, color=color.lime, textcolor=color.lime, size=size.tiny)
+plotshape(fireDn, title="Sıkışma bozuldu AŞAĞI",  text="PATLAMA▼", style=shape.flag, location=location.bottom, color=color.orange, textcolor=color.orange, size=size.tiny)
 
 // ============================================================
 //   2) OBV TREND ÇİZGİSİ OLUŞUMU
+//      Çizgi her bar yeniden hesaplanır; en güncel çizginin başlangıcı veya eğimi
+//      değiştiyse YENİ bir çizgi oluşmuştur. (Kırılım barında oluşan yer değişimi
+//      "yeni çizgi" değil "kırılım" olarak raporlanır.)
 // ============================================================
-loLineExists = countlinelo > 0
-hiLineExists = countlinehi > 0
-newLoLine = loLineExists and not loLineExists[1]
-newHiLine = hiLineExists and not hiLineExists[1]
+newLoLine = not na(loSlope) and (na(loSlope[1]) or loBar0 != loBar0[1] or loSlope != loSlope[1]) and not loBreak
+newHiLine = not na(hiSlope) and (na(hiSlope[1]) or hiBar0 != hiBar0[1] or hiSlope != hiSlope[1]) and not hiBreak
 
 // ============================================================
 //   3) OBV UYUMSUZLUK (Fiyat ↔ OBV)
@@ -206,48 +246,65 @@ bearDiv = phFound and priceHH and oscLH
 // ---- Görsel işaretler ----
 plotshape(newLoLine, title="Alt trend oluştu", style=shape.triangleup,   location=location.bottom, color=color.lime, size=size.tiny)
 plotshape(newHiLine, title="Üst trend oluştu", style=shape.triangledown, location=location.top,    color=color.red,  size=size.tiny)
+plotshape(hiBreak, title="Direnç kırıldı (boğa)", text="KIRILIM▲", style=shape.labelup,   location=location.bottom, color=color.teal, textcolor=color.white, size=size.tiny)
+plotshape(loBreak, title="Destek kırıldı (ayı)",  text="KIRILIM▼", style=shape.labeldown, location=location.top,    color=color.red,  textcolor=color.white, size=size.tiny)
 plotshape(bullDiv, title="Boğa uyumsuzluğu", text="Boğa", style=shape.labelup,   location=location.bottom, color=color.green,  textcolor=color.white, offset=-prd, size=size.tiny)
 plotshape(bearDiv, title="Ayı uyumsuzluğu",  text="Ayı",  style=shape.labeldown, location=location.top,    color=color.maroon, textcolor=color.white, offset=-prd, size=size.tiny)
 
 // ============================================================
-//   MESAJI OBV CİNSİNDEN + KOMBİNASYON OLARAK KUR
+//   MESAJI GÖSTERGE CİNSİNDEN + KOMBİNASYON OLARAK KUR
 //   "sıkışma şu an aktif mi ya da son sqWindow bar içinde miydi?" → birleşim tespiti
 // ============================================================
 sqNow    = squeeze or (barssince(squeeze) <= sqWindow)   // sıkışma bölgesi aktif/yakın
-divNow   = bullDiv or bearDiv                            // OBV uyumsuzluk oldu
-trendNow = newLoLine or newHiLine                        // OBV trend oluştu
+divNow   = bullDiv or bearDiv                            // uyumsuzluk oldu
+trendNow = newLoLine or newHiLine                        // trend çizgisi oluştu
+breakNow = loBreak or hiBreak                            // trend çizgisi kırıldı
 
-// Mesaj parçaları
-p_div   = bullDiv   ? "OBV boğa uyumsuzluk" : bearDiv ? "OBV ayı uyumsuzluk" : ""
-p_trend = newLoLine ? "OBV alt trend"       : newHiLine ? "OBV üst trend"    : ""
-p_sqEv  = squeezeStart ? "sıkışma başladı"  : squeezeFire ? "sıkışma bozuldu (hareket)" : ""
+// Mesaj parçaları (seçilen göstergenin adıyla)
+p_div   = bullDiv and bearDiv ? indi + " boğa+ayı uyumsuzluk" :
+   bullDiv ? indi + " boğa uyumsuzluk (" + tostring(prd) + " bar önceki dip)" :
+   bearDiv ? indi + " ayı uyumsuzluk (" + tostring(prd) + " bar önceki tepe)" : ""
+p_trend = newLoLine ? indi + " alt trend" : newHiLine ? indi + " üst trend" : ""
+p_brk   = hiBreak ? indi + " direnç kırılımı (boğa)" : loBreak ? indi + " destek kırılımı (ayı)" : ""
+p_sqEv  = squeezeStart ? "sıkışma başladı" : fireUp ? "sıkışma bozuldu YUKARI" : fireDn ? "sıkışma bozuldu AŞAĞI" : ""
 
 // Parçaları " + " ile birleştir
 combo = p_div
 combo := p_trend == "" ? combo : (combo == "" ? p_trend : combo + " + " + p_trend)
+combo := p_brk   == "" ? combo : (combo == "" ? p_brk   : combo + " + " + p_brk)
 combo := p_sqEv  == "" ? combo : (combo == "" ? p_sqEv  : combo + " + " + p_sqEv)
-// Sıkışma OLAYI bu barda yoksa ama sıkışma bölgesi aktifse ve trend/uyumsuzluk olduysa → "sıkışma ile birlikte"
-combo := (p_sqEv == "" and sqNow and (divNow or trendNow)) ? (combo + " + sıkışma (aktif)") : combo
+// Sıkışma OLAYI bu barda yoksa ama sıkışma bölgesi aktifse ve trend/kırılım/uyumsuzluk olduysa → "sıkışma ile birlikte"
+combo := (p_sqEv == "" and sqNow and (divNow or trendNow or breakNow)) ? (combo + " + sıkışma (aktif)") : combo
 
 // ============================================================
 //   ALARMLAR  ({{ticker}} ve {{interval}} otomatik dolar)
+//   alertcondition mesajları sabit olmak zorunda; gösterge OBV dışında seçilirse
+//   doğru adı "Any alert() function call" alarmındaki mesaj verir.
 // ============================================================
 // Tekil koşullar
-alertcondition(squeezeStart, title="DİKKAT - Sıkışma Başladı",       message="DİKKAT — OBV: volatilite sıkışması başladı (izlemeye al) — {{ticker}} {{interval}}")
-alertcondition(squeezeFire,  title="DİKKAT - Sıkışma Bozuldu",       message="DİKKAT — OBV: sıkışma bozuldu, hareket başlıyor — {{ticker}} {{interval}}")
-alertcondition(newLoLine,    title="DİKKAT - OBV Alt Trend",         message="DİKKAT — OBV alt trend (destek) oluştu — {{ticker}} {{interval}}")
-alertcondition(newHiLine,    title="DİKKAT - OBV Üst Trend",         message="DİKKAT — OBV üst trend (direnç) oluştu — {{ticker}} {{interval}}")
-alertcondition(bullDiv,      title="DİKKAT - OBV Boğa Uyumsuzluğu",  message="DİKKAT — OBV boğa uyumsuzluk oluştu — {{ticker}} {{interval}}")
-alertcondition(bearDiv,      title="DİKKAT - OBV Ayı Uyumsuzluğu",   message="DİKKAT — OBV ayı uyumsuzluk oluştu — {{ticker}} {{interval}}")
+alertcondition(squeezeStart, title="DİKKAT - Sıkışma Başladı",          message="DİKKAT — volatilite sıkışması başladı (izlemeye al) — {{ticker}} {{interval}}")
+alertcondition(squeezeFire,  title="DİKKAT - Sıkışma Bozuldu",          message="DİKKAT — sıkışma bozuldu, hareket başlıyor — {{ticker}} {{interval}}")
+alertcondition(fireUp,       title="DİKKAT - Sıkışma Bozuldu YUKARI",   message="DİKKAT — sıkışma YUKARI bozuldu — {{ticker}} {{interval}}")
+alertcondition(fireDn,       title="DİKKAT - Sıkışma Bozuldu AŞAĞI",    message="DİKKAT — sıkışma AŞAĞI bozuldu — {{ticker}} {{interval}}")
+alertcondition(newLoLine,    title="DİKKAT - OBV Alt Trend",            message="DİKKAT — OBV alt trend (destek) oluştu — {{ticker}} {{interval}}")
+alertcondition(newHiLine,    title="DİKKAT - OBV Üst Trend",            message="DİKKAT — OBV üst trend (direnç) oluştu — {{ticker}} {{interval}}")
+alertcondition(hiBreak,      title="DİKKAT - OBV Direnç Kırılımı",      message="DİKKAT — OBV direnç çizgisini YUKARI kırdı (boğa) — {{ticker}} {{interval}}")
+alertcondition(loBreak,      title="DİKKAT - OBV Destek Kırılımı",      message="DİKKAT — OBV destek çizgisini AŞAĞI kırdı (ayı) — {{ticker}} {{interval}}")
+alertcondition(bullDiv,      title="DİKKAT - OBV Boğa Uyumsuzluğu",     message="DİKKAT — OBV boğa uyumsuzluk oluştu — {{ticker}} {{interval}}")
+alertcondition(bearDiv,      title="DİKKAT - OBV Ayı Uyumsuzluğu",      message="DİKKAT — OBV ayı uyumsuzluk oluştu — {{ticker}} {{interval}}")
 
 // Birleşim (confluence) koşulları - en güçlü sinyaller
 divPlusSqueeze   = divNow   and sqNow
 trendPlusSqueeze = trendNow and sqNow
-alertcondition(divPlusSqueeze,   title="DİKKAT - OBV Uyumsuzluk + Sıkışma", message="DİKKAT — OBV uyumsuzluk + sıkışma birlikte — {{ticker}} {{interval}}")
-alertcondition(trendPlusSqueeze, title="DİKKAT - OBV Trend + Sıkışma",      message="DİKKAT — OBV trend + sıkışma birlikte — {{ticker}} {{interval}}")
+bullBrkSqueeze   = hiBreak  and sqNow      // sıkışmadan çıkarken OBV direnç kırdı → yükseliş teyidi
+bearBrkSqueeze   = loBreak  and sqNow      // sıkışmadan çıkarken OBV destek kırdı → düşüş teyidi
+alertcondition(divPlusSqueeze,   title="DİKKAT - OBV Uyumsuzluk + Sıkışma",       message="DİKKAT — OBV uyumsuzluk + sıkışma birlikte — {{ticker}} {{interval}}")
+alertcondition(trendPlusSqueeze, title="DİKKAT - OBV Trend + Sıkışma",            message="DİKKAT — OBV trend + sıkışma birlikte — {{ticker}} {{interval}}")
+alertcondition(bullBrkSqueeze,   title="DİKKAT - OBV Direnç Kırılımı + Sıkışma",  message="DİKKAT — sıkışmada OBV direnç kırılımı (yükseliş teyidi) — {{ticker}} {{interval}}")
+alertcondition(bearBrkSqueeze,   title="DİKKAT - OBV Destek Kırılımı + Sıkışma",  message="DİKKAT — sıkışmada OBV destek kırılımı (düşüş teyidi) — {{ticker}} {{interval}}")
 
 // Hepsini TEK alarmda toplamak için: alarm kurarken "Any alert() function call" seç.
-// Mesaj, o barda oluşan durumları OBV cinsinden ve kombinasyon olarak yazar.
-anyEvent = squeezeStart or squeezeFire or newLoLine or newHiLine or bullDiv or bearDiv
+// Mesaj, o barda oluşan durumları gösterge cinsinden ve kombinasyon olarak yazar.
+anyEvent = squeezeStart or squeezeFire or newLoLine or newHiLine or breakNow or bullDiv or bearDiv
 if anyEvent
     alert("DİKKAT — " + combo + " — " + syminfo.ticker + " " + timeframe.period, alert.freq_once_per_bar_close)
