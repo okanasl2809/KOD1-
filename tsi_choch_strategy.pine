@@ -1,0 +1,213 @@
+//@version=6
+strategy("TSI + CHoCH Strateji", shorttitle="TSI+CHoCH S", overlay=true,
+     initial_capital=10000, currency=currency.NONE,
+     commission_type=strategy.commission.percent, commission_value=0.1, slippage=2,
+     pyramiding=0)
+
+// ============ GİRDİLER ============
+// --- TSI ---
+grpTSI    = "TSI Ayarları"
+longLen   = input.int(25,  "TSI Long Length",  minval=1, group=grpTSI)
+shortLen  = input.int(13,  "TSI Short Length", minval=1, group=grpTSI)
+osThresh  = input.float(-35, "Oversold eşiği (long kurulumu)",   group=grpTSI)
+obThresh  = input.float(35,  "Overbought eşiği (short kurulumu)", group=grpTSI)
+
+// --- Piyasa Yapısı ---
+grpMS       = "Piyasa Yapısı (CHoCH)"
+pivotLen    = input.int(5, "Swing pivot uzunluğu", minval=1, group=grpMS)
+strictCHoCH = input.bool(true, "Sıkı CHoCH (önce ters yönde kırılım şart)", group=grpMS, tooltip="Açık: yukarı CHoCH için yapının önce düşüşe dönmüş olması gerekir (yeşil çizgi kapanışla kırılmış olmalı). Kapalı: yapı nötrken gelen ilk kırılım da sayılır.")
+maxWait     = input.int(50, "Aşırı bölge → CHoCH max bar (0 = sınırsız)", minval=0, group=grpMS)
+
+// --- Filtreler ---
+grpF     = "Filtreler"
+useTrend = input.bool(false, "EMA trend filtresi", group=grpF, tooltip="Long sadece fiyat EMA üstündeyken, short sadece altındayken.")
+emaLen   = input.int(200, "EMA uzunluğu", minval=1, group=grpF)
+useVol   = input.bool(false, "Hacim filtresi", group=grpF, tooltip="Kırılım barının hacmi, 20 bar ortalamasının belirtilen katından büyük olmalı.")
+volMult  = input.float(1.2, "Hacim çarpanı", minval=0.1, step=0.1, group=grpF)
+startDate = input.time(timestamp("01 Jan 2018 00:00 +0000"), "Test başlangıç tarihi", group=grpF)
+
+// --- Risk / Çıkış ---
+grpR       = "Risk ve Çıkış"
+riskPct    = input.float(1.0, "İşlem başına risk (% sermaye)", minval=0.1, step=0.1, group=grpR)
+atrLen     = input.int(14, "ATR uzunluğu", minval=1, group=grpR)
+slBuf      = input.float(0.5, "Stop tamponu (ATR katı)", minval=0, step=0.1, group=grpR, tooltip="Stop, swing seviyesinin bu kadar ATR ötesine konur. İğnelerle erken stop olmayı azaltır.")
+maxStopAtr = input.float(4.0, "Maksimum stop mesafesi (ATR katı, 0 = sınırsız)", minval=0, step=0.5, group=grpR, tooltip="Stop bundan uzaksa işleme girilmez.")
+useTP      = input.bool(true, "Sabit hedef (R katı) kullan", group=grpR)
+rr         = input.float(2.0, "Hedef (R katı)", minval=0.5, step=0.25, group=grpR)
+useBE      = input.bool(true, "Başa baş stop", group=grpR)
+beR        = input.float(1.0, "Başa başa çekme seviyesi (R)", minval=0.25, step=0.25, group=grpR)
+useTrail   = input.bool(true, "Yapısal iz süren stop", group=grpR, tooltip="Long'da yeni swing low onaylandıkça stop onun altına taşınır (short'ta tersi).")
+allowShort = input.bool(false, "Short işlemlere izin ver", group=grpR)
+
+// --- Görünüm ---
+grpD       = "Görünüm"
+showStruct = input.bool(true, "Swing seviyelerini göster", group=grpD)
+showTable  = input.bool(true, "TSI değer kutusu", group=grpD)
+
+// ============ HESAPLAR ============
+dsmooth(src, l, s) =>
+    ta.ema(ta.ema(src, l), s)
+
+pc  = ta.change(close)
+tsi = 100 * (dsmooth(pc, longLen, shortLen) / dsmooth(math.abs(pc), longLen, shortLen))
+atr = ta.atr(atrLen)
+ema = ta.ema(close, emaLen)
+volAvg = ta.sma(volume, 20)
+
+// ============ PİYASA YAPISI ============
+ph = ta.pivothigh(pivotLen, pivotLen)
+pl = ta.pivotlow(pivotLen, pivotLen)
+
+var float lastHigh   = na
+var float lastLow    = na
+var bool  highBroken = true    // son swing high kırıldı mı (aynı seviye iki kez sayılmasın)
+var bool  lowBroken  = true
+var int   msDir      = 0       // 1 = yükseliş, -1 = düşüş, 0 = nötr
+
+newPH = not na(ph)
+newPL = not na(pl)
+if newPH
+    lastHigh   := ph
+    highBroken := false
+if newPL
+    lastLow   := pl
+    lowBroken := false
+
+// crossover yerine "henüz kırılmamış seviyenin üstünde kapanış": pivot gecikmeli
+// onaylandığında fiyat zaten seviyenin üstündeyse de kırılım kaçmaz.
+bullBreak = not highBroken and close > lastHigh
+bearBreak = not lowBroken  and close < lastLow
+
+// Taze kırılım: önceki kapanış seviyenin altındaydı (geç fark edilen kırılımla işleme girme)
+freshBull = bullBreak and close[1] <= lastHigh
+freshBear = bearBreak and close[1] >= lastLow
+
+bullCHoCH = bullBreak and (strictCHoCH ? msDir == -1 : msDir <= 0)
+bearCHoCH = bearBreak and (strictCHoCH ? msDir == 1  : msDir >= 0)
+
+if bullBreak
+    highBroken := true
+    msDir      := 1
+if bearBreak
+    lowBroken := true
+    msDir     := -1
+
+// ============ KURULUMLAR ============
+var int sinceOS = -1     // TSI oversold'dan beri geçen bar (-1 = kurulum yok)
+var int sinceOB = -1
+
+if tsi < osThresh
+    sinceOS := 0
+else if sinceOS >= 0
+    sinceOS += 1
+
+if tsi > obThresh
+    sinceOB := 0
+else if sinceOB >= 0
+    sinceOB += 1
+
+armedL = sinceOS >= 0 and (maxWait == 0 or sinceOS <= maxWait)
+armedS = sinceOB >= 0 and (maxWait == 0 or sinceOB <= maxWait)
+
+// ============ FİLTRELER VE RİSK ============
+inDate = time >= startDate
+volOK  = not useVol or volume > volAvg * volMult
+trendL = not useTrend or close > ema
+trendS = not useTrend or close < ema
+
+longSL    = lastLow  - atr * slBuf
+shortSL   = lastHigh + atr * slBuf
+longRisk  = close - longSL
+shortRisk = shortSL - close
+longRiskOK  = not na(longSL)  and longRisk  > 0 and (maxStopAtr == 0 or longRisk  <= atr * maxStopAtr)
+shortRiskOK = not na(shortSL) and shortRisk > 0 and (maxStopAtr == 0 or shortRisk <= atr * maxStopAtr)
+
+longSetup  = armedL and bullCHoCH
+shortSetup = armedS and bearCHoCH
+
+longSig  = longSetup  and freshBull and trendL and volOK and longRiskOK  and inDate
+shortSig = shortSetup and freshBear and trendS and volOK and shortRiskOK and inDate and allowShort
+
+// CHoCH oluştuysa kurulum tüketilir (filtreye takılsa bile aynı kurulum tekrar kullanılmaz)
+if longSetup
+    sinceOS := -1
+if shortSetup
+    sinceOB := -1
+
+// Riske göre pozisyon büyüklüğü: stop olursa sermayenin riskPct'i kadar kaybedilir.
+// Kaldıraç kullanılmaz (en fazla sermayenin tamamı).
+calcQty(riskPerUnit) =>
+    qtyRisk = strategy.equity * riskPct / 100 / riskPerUnit
+    qtyMax  = strategy.equity / close
+    math.min(qtyRisk, qtyMax)
+
+// ============ İŞLEMLER ============
+var float stopL  = na
+var float tpL    = na
+var float riskL  = na
+var bool  beDoneL = false
+var float stopS  = na
+var float tpS    = na
+var float riskS  = na
+var bool  beDoneS = false
+
+if longSig and strategy.position_size <= 0
+    riskL   := longRisk
+    stopL   := longSL
+    tpL     := useTP ? close + longRisk * rr : na
+    beDoneL := false
+    strategy.entry("Long", strategy.long, qty=calcQty(longRisk))
+    alert("TSI+CHoCH LONG " + syminfo.ticker + " | stop: " + str.tostring(longSL, format.mintick), alert.freq_once_per_bar_close)
+
+if shortSig and strategy.position_size >= 0
+    riskS   := shortRisk
+    stopS   := shortSL
+    tpS     := useTP ? close - shortRisk * rr : na
+    beDoneS := false
+    strategy.entry("Short", strategy.short, qty=calcQty(shortRisk))
+    alert("TSI+CHoCH SHORT " + syminfo.ticker + " | stop: " + str.tostring(shortSL, format.mintick), alert.freq_once_per_bar_close)
+
+// Açık pozisyon yönetimi
+if strategy.position_size > 0
+    entry = strategy.position_avg_price
+    if useBE and not beDoneL and high >= entry + riskL * beR
+        stopL   := math.max(stopL, entry)
+        beDoneL := true
+    if useTrail and newPL
+        stopL := math.max(stopL, pl - atr * slBuf)
+
+if strategy.position_size < 0
+    entry = strategy.position_avg_price
+    if useBE and not beDoneS and low <= entry - riskS * beR
+        stopS   := math.min(stopS, entry)
+        beDoneS := true
+    if useTrail and newPH
+        stopS := math.min(stopS, ph + atr * slBuf)
+
+strategy.exit("L-Çıkış", "Long",  stop=stopL, limit=tpL)
+strategy.exit("S-Çıkış", "Short", stop=stopS, limit=tpS)
+
+// ============ ÇİZİMLER ============
+plot(showStruct ? lastHigh : na, "Swing High", color=color.new(color.red,   40), style=plot.style_stepline)
+plot(showStruct ? lastLow  : na, "Swing Low",  color=color.new(color.green, 40), style=plot.style_stepline)
+plot(useTrend ? ema : na, "EMA", color=color.new(color.gray, 30))
+
+plot(strategy.position_size > 0 ? stopL : na, "Long Stop",  color=color.red,   style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size > 0 ? tpL   : na, "Long Hedef", color=color.lime,  style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size < 0 ? stopS : na, "Short Stop",  color=color.red,  style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size < 0 ? tpS   : na, "Short Hedef", color=color.lime, style=plot.style_linebr, linewidth=2)
+
+plotshape(longSig,  title="Long sinyali",  style=shape.triangleup,   location=location.belowbar, color=#26A69A, size=size.small, text="L", textcolor=color.white)
+plotshape(shortSig, title="Short sinyali", style=shape.triangledown, location=location.abovebar, color=#EF5350, size=size.small, text="S", textcolor=color.white)
+// Kurulum oluştu ama filtreye takıldı (neden işlem açılmadığını görmek için)
+plotshape(longSetup  and not longSig,  title="Long filtrelendi",  style=shape.xcross, location=location.belowbar, color=color.new(color.gray, 30), size=size.tiny)
+plotshape(shortSetup and not shortSig and allowShort, title="Short filtrelendi", style=shape.xcross, location=location.abovebar, color=color.new(color.gray, 30), size=size.tiny)
+
+bgcolor(armedL ? color.new(color.blue, 92) : na, title="Long kurulumu aktif")
+bgcolor(allowShort and armedS ? color.new(color.orange, 92) : na, title="Short kurulumu aktif")
+
+var table t = table.new(position.top_right, 1, 2, border_width=1)
+if showTable and barstate.islast
+    table.cell(t, 0, 0, "TSI", text_color=color.white, bgcolor=color.new(color.gray, 20))
+    tsiCol = tsi < osThresh ? color.red : tsi > obThresh ? color.green : color.orange
+    table.cell(t, 0, 1, str.tostring(tsi, "#.##"), text_color=color.white, bgcolor=color.new(tsiCol, 20))
