@@ -1,0 +1,640 @@
+//@version=6
+strategy("SKR Alım-Satım Sistemi (TSI + Sıkışma + Ichimoku + OBV)", shorttitle="SKR-SİSTEM", overlay=true,
+     initial_capital=10000, currency=currency.NONE,
+     commission_type=strategy.commission.percent, commission_value=0.1, slippage=2,
+     pyramiding=0, max_labels_count=500)
+
+// =====================================================================
+//  SİSTEMİN MANTIĞI
+//  TETİK   : Kapanış, henüz kırılmamış KIRMIZI çizginin (son swing high) üstünde.
+//  KURULUM : Kırılımdan önce/anında SIKIŞMA (MEMATİ) ve/veya yakın zamanda TSI aşırı satım.
+//  ONAY PUANI (her biri +1, en fazla 8):
+//    1 CHoCH      : yapı düşüşteyken gelen ilk yukarı kırılım
+//    2 Bulut      : fiyat Ichimoku bulutunun üstünde
+//    3 TK         : son tkWin mumda TK güçlü/orta alım (POLAT)
+//    4 Hacim      : hacim ≥ ortalama x çarpan (Şart 3)
+//    5 OBV trend  : OBV yükselen desteğin üstünde ya da alçalan direnci kırmış
+//    6 Uyumsuzluk : son divWin mumda OBV veya TSI pozitif uyumsuzluk
+//    7 Üst TF 1   : üst zaman diliminde OBV trendi yukarı, fiyat bulutun altında değil
+//    8 Üst TF 2   : aynısı, ikinci üst zaman dilimi
+//  GİRİŞ   : Puan ≥ "en az puan" ise kırılım mumunun kapanışında.
+//            Puan yetmezse (ya da kırılım geç fark edildiyse) hacimli RETEST beklenir,
+//            retest mumunda puan yeniden hesaplanır.
+//  ÇIKIŞ   : Stop = yeşil çizgi (retestte retest dibi) - ATR tamponu, R katı hedef,
+//            başa baş, yapısal iz süren stop, isteğe bağlı OBV destek kırılımında çıkış.
+//  POZİSYON: Her işlemde sermayenin riskPct'i riske edilir (kaldıraçsız).
+//  SHORT   : Her şeyin tersi (isteğe bağlı).
+//  Tüm hesaplar mum kapanışında yapılır; üst zaman dilimi verileri kapanmış mumdan alınır.
+// =====================================================================
+
+// =====================================================================
+// GİRDİLER
+// =====================================================================
+grpSY      = "Sistem"
+setupMode  = input.string("Sıkışma veya TSI", "Kurulum şartı", options=["Sıkışma veya TSI", "Sadece Sıkışma", "Sadece TSI", "Sıkışma ve TSI", "Kurulum şartı yok"], group=grpSY)
+minScore   = input.int(3, "Girmek için en az onay puanı (0-8)", minval=0, maxval=8, group=grpSY)
+entryBreak = input.bool(true, "Kırılım mumunda gir", group=grpSY)
+entryRt    = input.bool(true, "Puan yetmezse hacimli retestte gir", group=grpSY)
+allowShort = input.bool(false, "Short işlemler", group=grpSY)
+noBadCloud = input.bool(false, "Long'u bulut altında / short'u bulut üstünde açma", group=grpSY)
+startDate  = input.time(timestamp("01 Jan 2020 00:00 +0300"), "Test başlangıcı", group=grpSY)
+
+grpMS    = "Kırmızı / Yeşil Çizgi"
+pivotLen = input.int(5, "Swing pivot uzunluğu", minval=1, group=grpMS)
+
+grpTS    = "TSI"
+tsiLong  = input.int(25, "TSI Long", minval=1, group=grpTS)
+tsiShort = input.int(13, "TSI Short", minval=1, group=grpTS)
+osThresh = input.float(-35, "Aşırı satım eşiği", group=grpTS)
+obThresh = input.float(35, "Aşırı alım eşiği", group=grpTS)
+tsiWin   = input.int(50, "Aşırı bölgeden sonra kırılım için max mum", minval=1, group=grpTS)
+
+grpSQ   = "Sıkışma (TTM Squeeze)"
+sqzLen  = input.int(20, "Uzunluk", minval=2, group=grpSQ)
+bbMult  = input.float(2.0, "Bollinger çarpanı", step=0.1, group=grpSQ)
+kcMult  = input.float(1.5, "Keltner çarpanı", step=0.1, group=grpSQ)
+minSqz  = input.int(5, "En az kaç mum sıkışma", minval=1, group=grpSQ)
+sqzLook = input.int(3, "Sıkışma bittikten sonra max mum", minval=0, group=grpSQ)
+
+grpIC     = "Ichimoku"
+tenLen    = input.int(9,  "Tenkan", minval=1, group=grpIC)
+kijLen    = input.int(26, "Kijun", minval=1, group=grpIC)
+sbLen     = input.int(52, "Senkou B", minval=1, group=grpIC)
+disp      = input.int(26, "Kaydırma", minval=2, group=grpIC)
+tkWin     = input.int(10, "TK sinyali geçerlilik (mum)", minval=0, group=grpIC)
+showCloud = input.bool(false, "Bulutu çiz", group=grpIC)
+
+grpVL   = "Hacim"
+volLen  = input.int(20, "Hacim ortalaması (mum)", minval=1, group=grpVL)
+volMult = input.float(1.5, "Ortalama hacmin en az kaç katı", minval=0.1, step=0.1, group=grpVL)
+
+grpOB     = "OBV / Uyumsuzluk"
+obvPivLen = input.int(5, "OBV trend çizgisi pivot uzunluğu", minval=1, group=grpOB)
+obvMaxAge = input.int(100, "OBV trend çizgisi en fazla kaç mum geçerli", minval=10, group=grpOB)
+divWin    = input.int(30, "Uyumsuzluk geçerlilik (mum)", minval=1, group=grpOB)
+divMinGap = input.int(5, "Uyumsuzluk: iki pivot arası en az mum", minval=1, group=grpOB)
+divMaxGap = input.int(60, "Uyumsuzluk: iki pivot arası en fazla mum", minval=2, group=grpOB)
+
+grpHT   = "Üst Zaman Dilimleri"
+useHtf1 = input.bool(true, "Üst TF 1", inline="h1", group=grpHT)
+htf1    = input.timeframe("60", "", inline="h1", group=grpHT)
+useHtf2 = input.bool(true, "Üst TF 2", inline="h2", group=grpHT)
+htf2    = input.timeframe("240", "", inline="h2", group=grpHT)
+
+grpRT     = "Retest"
+retestWin = input.int(20, "Kırılımdan sonra takip (mum)", minval=1, group=grpRT)
+tolMult   = input.float(0.3, "Retest toleransı (x ATR)", minval=0, step=0.05, group=grpRT)
+failMult  = input.float(0.5, "Fake iptal eşiği (x ATR)", minval=0, step=0.05, group=grpRT)
+
+grpR       = "Risk ve Çıkış"
+riskPct    = input.float(1.0, "İşlem başına risk (% sermaye)", minval=0.1, step=0.1, group=grpR)
+atrLen     = input.int(14, "ATR uzunluğu", minval=1, group=grpR)
+slBuf      = input.float(0.5, "Stop tamponu (x ATR)", minval=0, step=0.1, group=grpR)
+maxStopAtr = input.float(4.0, "Maksimum stop mesafesi (x ATR, 0 = sınırsız)", minval=0, step=0.5, group=grpR)
+useTP      = input.bool(true, "Sabit hedef (R katı)", group=grpR)
+rr         = input.float(2.0, "Hedef (R)", minval=0.5, step=0.25, group=grpR)
+useBE      = input.bool(true, "Başa baş stop", group=grpR)
+beR        = input.float(1.0, "Başa başa çekme seviyesi (R)", minval=0.25, step=0.25, group=grpR)
+useTrail   = input.bool(true, "Yapısal iz süren stop", group=grpR)
+exitObv    = input.bool(false, "OBV destek (short'ta direnç) kırılınca çık", group=grpR)
+
+grpDS      = "Görünüm"
+showStruct = input.bool(true, "Kırmızı / yeşil çizgiler", group=grpDS)
+showTable  = input.bool(true, "Durum tablosu", group=grpDS)
+tblPosStr  = input.string("Sağ Alt", "Tablo konumu", options=["Sağ Üst", "Sağ Alt", "Sol Üst", "Sol Alt"], group=grpDS)
+
+// =====================================================================
+// YARDIMCI FONKSİYONLAR
+// =====================================================================
+donchian(len) =>
+    math.avg(ta.lowest(len), ta.highest(len))
+
+// Ichimoku: [bulut konumu (1 üstünde, -1 altında, 0 içinde, 2 veri yok), TK alım tipi, TK satış tipi, senkouA, senkouB]
+// TK tipi: 2 = güçlü (kesişim bulutun üstünde/altında), 3 = orta (kesişim bulutun içinde)
+f_ichi() =>
+    ten   = donchian(tenLen)
+    kij   = donchian(kijLen)
+    sA    = math.avg(ten, kij)
+    sB    = donchian(sbLen)
+    d1    = disp - 1
+    cTop  = math.max(sA[d1], sB[d1])
+    cBot  = math.min(sA[d1], sB[d1])
+    cHas  = not na(cTop) and not na(cBot)
+    cPos  = not cHas ? 2 : close > cTop ? 1 : close < cBot ? -1 : 0
+    chTop = math.max(sA[2 * d1], sB[2 * d1])
+    chBot = math.min(sA[2 * d1], sB[2 * d1])
+    chHas = not na(chTop) and not na(chBot)
+    tkUp  = ta.crossover(ten, kij)
+    tkDn  = ta.crossunder(ten, kij)
+    xLvl  = math.avg(ten, kij)
+    xPos  = not cHas ? 2 : xLvl > cTop ? 1 : xLvl < cBot ? -1 : 0
+    tkB   = (tkUp and chHas and close > chTop and cPos == 1) ? (xPos == 1 ? 2 : xPos == 0 ? 3 : 0) : 0
+    tkS   = (tkDn and chHas and close < chBot and cPos == -1) ? (xPos == -1 ? 2 : xPos == 0 ? 3 : 0) : 0
+    [cPos, tkB, tkS, sA, sB]
+
+// OBV trend çizgileri (son iki pivot)
+// sup: 0 yok, 1 OBV yükselen desteğin ÜSTÜNDE, 2 desteği AŞAĞI kırdı
+// res: 0 yok, 1 OBV alçalan direncin ALTINDA, 2 direnci YUKARI kırdı
+f_obvTL(src, len) =>
+    phO = ta.pivothigh(src, len, len)
+    plO = ta.pivotlow(src, len, len)
+    var float h1  = na
+    var int   hx1 = na
+    var float h2  = na
+    var int   hx2 = na
+    var float l1  = na
+    var int   lx1 = na
+    var float l2  = na
+    var int   lx2 = na
+    if not na(phO)
+        h1  := h2
+        hx1 := hx2
+        h2  := phO
+        hx2 := bar_index - len
+    if not na(plO)
+        l1  := l2
+        lx1 := lx2
+        l2  := plO
+        lx2 := bar_index - len
+    float supVal = na
+    float resVal = na
+    if not na(l1) and not na(l2) and l2 > l1 and lx2 > lx1 and bar_index - lx2 <= obvMaxAge
+        supVal := l2 + (l2 - l1) / (lx2 - lx1) * (bar_index - lx2)
+    if not na(h1) and not na(h2) and h2 < h1 and hx2 > hx1 and bar_index - hx2 <= obvMaxAge
+        resVal := h2 + (h2 - h1) / (hx2 - hx1) * (bar_index - hx2)
+    sup = na(supVal) ? 0 : src >= supVal ? 1 : 2
+    res = na(resVal) ? 0 : src <= resVal ? 1 : 2
+    [sup, res]
+
+// +: yükselişi destekler, -: düşüşü destekler
+obvTLbias(u, r) =>
+    (u == 1 ? 1 : 0) + (r == 2 ? 1 : 0) - (u == 2 ? 1 : 0) - (r == 1 ? 1 : 0)
+
+obvTLtxt(u, r) =>
+    string t = ""
+    if u == 1
+        t += "destek üstünde ↗"
+    if u == 2
+        t += "desteği kırdı ↘"
+    if r == 1
+        t += (t == "" ? "" : " + ") + "direnç altında ↘"
+    if r == 2
+        t += (t == "" ? "" : " + ") + "direnci kırdı ↗"
+    t == "" ? "çizgi yok" : t
+
+// Fiyat pivotlarında osilatör uyumsuzluğu (pivotlar arası mesafe sınırlı)
+f_div(osc) =>
+    phD   = ta.pivothigh(pivotLen, pivotLen)
+    plD   = ta.pivotlow(pivotLen, pivotLen)
+    oscAt = osc[pivotLen]
+    x     = bar_index - pivotLen
+    var float pH  = na
+    var float pHo = na
+    var int   pHx = na
+    var float pLw = na
+    var float pLo = na
+    var int   pLx = na
+    bool bearD = false
+    bool bullD = false
+    if not na(phD)
+        if not na(pH) and x - pHx >= divMinGap and x - pHx <= divMaxGap and phD > pH and oscAt < pHo
+            bearD := true
+        pH  := phD
+        pHo := oscAt
+        pHx := x
+    if not na(plD)
+        if not na(pLw) and x - pLx >= divMinGap and x - pLx <= divMaxGap and plD < pLw and oscAt > pLo
+            bullD := true
+        pLw := plD
+        pLo := oscAt
+        pLx := x
+    [bearD, bullD]
+
+// Üst zaman dilimi: KAPANMIŞ mumun OBV trend yönü ve bulut konumu
+f_htf() =>
+    [u, r] = f_obvTL(ta.obv, obvPivLen)
+    [cp, hTkB, hTkS, hSA, hSB] = f_ichi()
+    bias = obvTLbias(u, r)
+    [bias[1], cp[1]]
+
+cloudName(cp) =>
+    na(cp) ? "—" : cp == 2 ? "veri yetersiz" : cp == 1 ? "ÜSTÜNDE" : cp == -1 ? "ALTINDA" : "İÇİNDE"
+
+tkName(t) =>
+    t == 2 ? "GÜÇLÜ" : t == 3 ? "ORTA" : "—"
+
+ck(b) =>
+    b ? "✓" : "✗"
+
+// =====================================================================
+// GÖSTERGELER
+// =====================================================================
+atr = ta.atr(atrLen)
+
+// ---------- TSI ----------
+pc       = ta.change(close)
+tsi      = 100 * ta.ema(ta.ema(pc, tsiLong), tsiShort) / ta.ema(ta.ema(math.abs(pc), tsiLong), tsiShort)
+tsiOsAgo = ta.barssince(tsi < osThresh)
+tsiObAgo = ta.barssince(tsi > obThresh)
+tsiL     = not na(tsiOsAgo) and tsiOsAgo <= tsiWin
+tsiS     = not na(tsiObAgo) and tsiObAgo <= tsiWin
+
+// ---------- Sıkışma ----------
+sqDev = bbMult * ta.stdev(close, sqzLen)
+sqRng = kcMult * ta.sma(ta.tr(true), sqzLen)
+sqz   = sqDev < sqRng
+var int sRun    = 0
+var int sEndBar = na
+var int sEndLen = 0
+if sqz
+    sRun += 1
+else
+    if sRun > 0
+        sEndBar := bar_index - 1
+        sEndLen := sRun
+    sRun := 0
+sqzAct = sqz and sRun >= minSqz
+sqzRec = not na(sEndBar) and bar_index - sEndBar <= sqzLook and sEndLen >= minSqz
+sqzOk  = sqzAct or sqzRec
+
+// ---------- Ichimoku ----------
+[cPos, tkBuy, tkSell, senA, senB] = f_ichi()
+var int tkBuyBar  = na
+var int tkBuyTp   = 0
+var int tkSellBar = na
+var int tkSellTp  = 0
+if tkBuy > 0
+    tkBuyBar := bar_index
+    tkBuyTp  := tkBuy
+if tkSell > 0
+    tkSellBar := bar_index
+    tkSellTp  := tkSell
+tkL = not na(tkBuyBar)  and bar_index - tkBuyBar  <= tkWin
+tkS = not na(tkSellBar) and bar_index - tkSellBar <= tkWin
+
+// ---------- Hacim (ortalama, mevcut mum hariç) ----------
+vAvg = ta.sma(volume, volLen)[1]
+vRat = nz(vAvg) > 0 ? volume / vAvg : na
+vOk  = not na(vRat) and vRat >= volMult
+
+// ---------- OBV trend çizgisi ----------
+obvV = ta.obv
+[obSup, obRes] = f_obvTL(obvV, obvPivLen)
+obBias = obvTLbias(obSup, obRes)
+obvL   = obBias > 0
+obvS   = obBias < 0
+obSupBrk = obSup == 2 and obSup[1] != 2
+obResBrk = obRes == 2 and obRes[1] != 2
+
+// ---------- Uyumsuzluk (OBV ve TSI) ----------
+[obBD, obUD] = f_div(obvV)
+[tsBD, tsUD] = f_div(tsi)
+agoObU = nz(ta.barssince(obUD), 100000)
+agoTsU = nz(ta.barssince(tsUD), 100000)
+agoObD = nz(ta.barssince(obBD), 100000)
+agoTsD = nz(ta.barssince(tsBD), 100000)
+divL   = agoObU <= divWin or agoTsU <= divWin
+divS   = agoObD <= divWin or agoTsD <= divWin
+
+// ---------- Üst zaman dilimleri ----------
+chartSec = timeframe.in_seconds()
+[h1Bias, h1Cld] = request.security(syminfo.tickerid, htf1, f_htf(), lookahead=barmerge.lookahead_on)
+[h2Bias, h2Cld] = request.security(syminfo.tickerid, htf2, f_htf(), lookahead=barmerge.lookahead_on)
+h1On = useHtf1 and timeframe.in_seconds(htf1) >= chartSec
+h2On = useHtf2 and timeframe.in_seconds(htf2) >= chartSec
+h1L  = h1On and nz(h1Bias) > 0 and nz(h1Cld, 2) != -1
+h1S  = h1On and nz(h1Bias) < 0 and nz(h1Cld, 2) != 1
+h2L  = h2On and nz(h2Bias) > 0 and nz(h2Cld, 2) != -1
+h2S  = h2On and nz(h2Bias) < 0 and nz(h2Cld, 2) != 1
+
+// =====================================================================
+// PİYASA YAPISI (kırmızı / yeşil çizgi)
+// =====================================================================
+ph = ta.pivothigh(pivotLen, pivotLen)
+pl = ta.pivotlow(pivotLen, pivotLen)
+
+var float lastHigh   = na
+var float lastLow    = na
+var bool  highBroken = true    // aynı seviye iki kez kırılım sayılmasın
+var bool  lowBroken  = true
+var int   msDir      = 0       // 1 yükseliş, -1 düşüş, 0 nötr
+
+newPL = not na(pl)
+newPH = not na(ph)
+if not na(ph)
+    lastHigh   := ph
+    highBroken := false
+if newPL
+    lastLow   := pl
+    lowBroken := false
+
+// crossover yerine "kırılmamış seviyenin ötesinde kapanış": pivot geç onaylansa da kırılım kaçmaz
+bullBreak = not highBroken and close > lastHigh
+bearBreak = not lowBroken  and close < lastLow
+// Taze kırılım: önceki kapanış seviyenin berisindeydi (geç fark edilen kırılımda retest beklenir)
+freshBull = bullBreak and close[1] <= lastHigh
+freshBear = bearBreak and close[1] >= lastLow
+bullChoch = bullBreak and msDir == -1
+bearChoch = bearBreak and msDir == 1
+
+if bullBreak
+    highBroken := true
+    msDir      := 1
+if bearBreak
+    lowBroken := true
+    msDir     := -1
+
+// =====================================================================
+// KURULUM VE PUAN
+// =====================================================================
+f_setup(sq, ts) =>
+    setupMode == "Sıkışma veya TSI" ? (sq or ts) : setupMode == "Sadece Sıkışma" ? sq : setupMode == "Sadece TSI" ? ts : setupMode == "Sıkışma ve TSI" ? (sq and ts) : true
+
+setupL = f_setup(sqzOk, tsiL)
+setupS = f_setup(sqzOk, tsiS)
+
+f_score(up, choch) =>
+    int s = 0
+    s += choch ? 1 : 0
+    s += (up ? cPos == 1 : cPos == -1) ? 1 : 0
+    s += (up ? tkL : tkS) ? 1 : 0
+    s += vOk ? 1 : 0
+    s += (up ? obvL : obvS) ? 1 : 0
+    s += (up ? divL : divS) ? 1 : 0
+    s += (up ? h1L : h1S) ? 1 : 0
+    s += (up ? h2L : h2S) ? 1 : 0
+    s
+
+f_detail(up, choch) =>
+    "CHoCH" + ck(choch) + " Bulut" + ck(up ? cPos == 1 : cPos == -1) + " TK" + ck(up ? tkL : tkS) + " Hacim" + ck(vOk) + " OBV" + ck(up ? obvL : obvS) + " Uyumsuzluk" + ck(up ? divL : divS) + " ÜstTF1" + ck(up ? h1L : h1S) + " ÜstTF2" + ck(up ? h2L : h2S)
+
+riskOk(r) =>
+    not na(r) and r > 0 and (maxStopAtr == 0 or r <= atr * maxStopAtr)
+
+// Riske göre pozisyon büyüklüğü (kaldıraçsız)
+calcQty(r) =>
+    math.min(strategy.equity * riskPct / 100 / r, strategy.equity / close)
+
+inDate = time >= startDate
+flat   = strategy.position_size == 0
+cldOkL = not noBadCloud or cPos != -1
+cldOkS = not noBadCloud or cPos != 1
+
+// =====================================================================
+// SİNYALLER: LONG
+// =====================================================================
+var bool  rtL      = false   // retest bekleniyor
+var float rtLvL    = na
+var int   rtBarL   = na
+var bool  rtChochL = false
+
+int   sigL = 0      // 1 kırılım, 2 retest
+float slL  = na
+int   scL  = 0
+bool  chL  = false
+
+// 1) Bekleyen retest
+if rtL
+    if not flat or close < rtLvL - failMult * atr or bar_index - rtBarL > retestWin
+        rtL := false
+    else if bar_index > rtBarL and low <= rtLvL + tolMult * atr and close > rtLvL and vOk
+        rtL := false
+        scR = f_score(true, rtChochL)
+        slR = math.min(low, rtLvL) - slBuf * atr
+        if scR >= minScore and riskOk(close - slR) and cldOkL and inDate
+            sigL := 2
+            slL  := slR
+            scL  := scR
+            chL  := rtChochL
+
+// 2) Yeni kırılım
+if bullBreak and setupL and flat
+    scB = f_score(true, bullChoch)
+    slB = lastLow - slBuf * atr
+    if entryBreak and freshBull and scB >= minScore and riskOk(close - slB) and cldOkL and inDate
+        sigL := 1
+        slL  := slB
+        scL  := scB
+        chL  := bullChoch
+        rtL  := false
+    else if entryRt
+        rtL      := true
+        rtLvL    := lastHigh
+        rtBarL   := bar_index
+        rtChochL := bullChoch
+
+// =====================================================================
+// SİNYALLER: SHORT
+// =====================================================================
+var bool  rtS      = false
+var float rtLvS    = na
+var int   rtBarS   = na
+var bool  rtChochS = false
+
+int   sigS = 0
+float slS  = na
+int   scS  = 0
+bool  chS  = false
+
+if allowShort
+    if rtS
+        if not flat or close > rtLvS + failMult * atr or bar_index - rtBarS > retestWin
+            rtS := false
+        else if bar_index > rtBarS and high >= rtLvS - tolMult * atr and close < rtLvS and vOk
+            rtS := false
+            scR = f_score(false, rtChochS)
+            slR = math.max(high, rtLvS) + slBuf * atr
+            if scR >= minScore and riskOk(slR - close) and cldOkS and inDate
+                sigS := 2
+                slS  := slR
+                scS  := scR
+                chS  := rtChochS
+    if bearBreak and setupS and flat
+        scB = f_score(false, bearChoch)
+        slB = lastHigh + slBuf * atr
+        if entryBreak and freshBear and scB >= minScore and riskOk(slB - close) and cldOkS and inDate
+            sigS := 1
+            slS  := slB
+            scS  := scB
+            chS  := bearChoch
+            rtS  := false
+        else if entryRt
+            rtS      := true
+            rtLvS    := lastLow
+            rtBarS   := bar_index
+            rtChochS := bearChoch
+
+// Aynı mumda iki yön çıkarsa ikisi de atlanır
+if sigL > 0 and sigS > 0
+    sigL := 0
+    sigS := 0
+
+// =====================================================================
+// İŞLEMLER
+// =====================================================================
+var float stopL = na
+var float tpL   = na
+var float riskL = na
+var bool  beL   = false
+var float stopS = na
+var float tpS   = na
+var float riskS = na
+var bool  beS   = false
+
+if sigL > 0 and flat
+    riskL := close - slL
+    stopL := slL
+    tpL   := useTP ? close + riskL * rr : na
+    beL   := false
+    strategy.entry("Long", strategy.long, qty=calcQty(riskL), comment=sigL == 1 ? "L kırılım " + str.tostring(scL) + "/8" : "L retest " + str.tostring(scL) + "/8")
+    alert("SKR LONG 🚀 " + syminfo.ticker + " " + timeframe.period + " — " + (sigL == 1 ? "kırılım" : "retest") +
+         "\nGiriş≈ " + str.tostring(close, format.mintick) + " | Stop: " + str.tostring(stopL, format.mintick) + (useTP ? " | Hedef: " + str.tostring(tpL, format.mintick) : "") +
+         "\nPuan " + str.tostring(scL) + "/8: " + f_detail(true, chL), alert.freq_once_per_bar_close)
+
+if sigS > 0 and flat
+    riskS := slS - close
+    stopS := slS
+    tpS   := useTP ? close - riskS * rr : na
+    beS   := false
+    strategy.entry("Short", strategy.short, qty=calcQty(riskS), comment=sigS == 1 ? "S kırılım " + str.tostring(scS) + "/8" : "S retest " + str.tostring(scS) + "/8")
+    alert("SKR SHORT 🔻 " + syminfo.ticker + " " + timeframe.period + " — " + (sigS == 1 ? "kırılım" : "retest") +
+         "\nGiriş≈ " + str.tostring(close, format.mintick) + " | Stop: " + str.tostring(stopS, format.mintick) + (useTP ? " | Hedef: " + str.tostring(tpS, format.mintick) : "") +
+         "\nPuan " + str.tostring(scS) + "/8: " + f_detail(false, chS), alert.freq_once_per_bar_close)
+
+// Açık pozisyon yönetimi
+if strategy.position_size > 0
+    ep = strategy.position_avg_price
+    if useBE and not beL and high >= ep + riskL * beR
+        stopL := math.max(stopL, ep)
+        beL   := true
+    if useTrail and newPL
+        stopL := math.max(stopL, pl - slBuf * atr)
+    if exitObv and obSupBrk
+        strategy.close("Long", comment="OBV destek kırıldı")
+
+if strategy.position_size < 0
+    ep = strategy.position_avg_price
+    if useBE and not beS and low <= ep - riskS * beR
+        stopS := math.min(stopS, ep)
+        beS   := true
+    if useTrail and newPH
+        stopS := math.min(stopS, ph + slBuf * atr)
+    if exitObv and obResBrk
+        strategy.close("Short", comment="OBV direnç kırıldı")
+
+strategy.exit("L-Çıkış", "Long",  stop=stopL, limit=tpL)
+strategy.exit("S-Çıkış", "Short", stop=stopS, limit=tpS)
+
+if strategy.position_size[1] > 0 and strategy.position_size == 0
+    alert("SKR LONG KAPANDI " + syminfo.ticker + " " + timeframe.period, alert.freq_once_per_bar_close)
+if strategy.position_size[1] < 0 and strategy.position_size == 0
+    alert("SKR SHORT KAPANDI " + syminfo.ticker + " " + timeframe.period, alert.freq_once_per_bar_close)
+
+// =====================================================================
+// ÇİZİMLER
+// =====================================================================
+plot(showStruct ? lastHigh : na, "Kırmızı (swing high)", color=color.new(color.red,   30), style=plot.style_stepline, linewidth=2)
+plot(showStruct ? lastLow  : na, "Yeşil (swing low)",    color=color.new(color.green, 30), style=plot.style_stepline, linewidth=2)
+plot(rtL ? rtLvL : na, "Long retest seviyesi",  color=color.aqua,    style=plot.style_linebr)
+plot(rtS ? rtLvS : na, "Short retest seviyesi", color=color.fuchsia, style=plot.style_linebr)
+
+plot(strategy.position_size > 0 ? stopL : na, "Long stop",   color=color.red,  style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size > 0 ? tpL   : na, "Long hedef",  color=color.lime, style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size < 0 ? stopS : na, "Short stop",  color=color.red,  style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size < 0 ? tpS   : na, "Short hedef", color=color.lime, style=plot.style_linebr, linewidth=2)
+
+pA = plot(showCloud ? senA : na, "Senkou A", color=color.new(color.green, 60), offset=disp - 1)
+pB = plot(showCloud ? senB : na, "Senkou B", color=color.new(color.red,   60), offset=disp - 1)
+fill(pA, pB, color=senA > senB ? color.new(color.green, 88) : color.new(color.red, 88), title="Bulut")
+
+plotshape(sigL == 1, title="Long kırılım", style=shape.triangleup,   location=location.belowbar, color=#00C853, size=size.small, text="L")
+plotshape(sigL == 2, title="Long retest",  style=shape.triangleup,   location=location.belowbar, color=#26A69A, size=size.small, text="L-RT")
+plotshape(sigS == 1, title="Short kırılım", style=shape.triangledown, location=location.abovebar, color=#D50000, size=size.small, text="S")
+plotshape(sigS == 2, title="Short retest",  style=shape.triangledown, location=location.abovebar, color=#EF5350, size=size.small, text="S-RT")
+
+bgcolor(sqzAct ? color.new(color.orange, 90) : na, title="Sıkışma")
+
+// =====================================================================
+// DURUM TABLOSU (son mum)
+// =====================================================================
+tblPos = tblPosStr == "Sağ Üst" ? position.top_right : tblPosStr == "Sağ Alt" ? position.bottom_right : tblPosStr == "Sol Üst" ? position.top_left : position.bottom_left
+var table tb = table.new(tblPos, 3, 16, border_width=1, frame_color=color.new(color.gray, 50), frame_width=1)
+
+cBull = color.new(#26A69A, 30)
+cBear = color.new(#EF5350, 30)
+cNeu  = color.new(color.gray, 60)
+cHdr  = color.new(color.gray, 25)
+cSqz  = color.new(color.orange, 30)
+
+if barstate.isfirst
+    table.merge_cells(tb, 1, 15, 2, 15)
+
+if showTable and barstate.islast
+    scNowL = f_score(true,  msDir == -1)
+    scNowS = f_score(false, msDir == 1)
+    sqTxt  = sqzAct ? "VAR (" + str.tostring(sRun) + " mum)" : sqzRec ? "yeni bitti" : sqz ? "başlıyor (" + str.tostring(sRun) + ")" : "—"
+    table.cell(tb, 0, 0, "SKR SİSTEM", text_color=color.white, bgcolor=cHdr, text_size=size.small)
+    table.cell(tb, 1, 0, "LONG",  text_color=color.white, bgcolor=cHdr, text_size=size.small)
+    table.cell(tb, 2, 0, "SHORT" + (allowShort ? "" : " (kapalı)"), text_color=color.white, bgcolor=cHdr, text_size=size.small)
+
+    table.cell(tb, 0, 1, "Sıkışma", text_color=color.white, bgcolor=cHdr, text_size=size.small)
+    table.cell(tb, 1, 1, sqTxt, text_color=color.white, bgcolor=sqzOk ? cSqz : cNeu, text_size=size.small)
+    table.cell(tb, 2, 1, sqTxt, text_color=color.white, bgcolor=sqzOk ? cSqz : cNeu, text_size=size.small)
+
+    table.cell(tb, 0, 2, "TSI " + str.tostring(tsi, "#.#"), text_color=color.white, bgcolor=cHdr, text_size=size.small)
+    table.cell(tb, 1, 2, tsiL ? "aşırı satım (" + str.tostring(tsiOsAgo) + " mum önce)" : "—", text_color=color.white, bgcolor=tsiL ? cBull : cNeu, text_size=size.small)
+    table.cell(tb, 2, 2, tsiS ? "aşırı alım (" + str.tostring(tsiObAgo) + " mum önce)" : "—", text_color=color.white, bgcolor=tsiS ? cBear : cNeu, text_size=size.small)
+
+    table.cell(tb, 0, 3, "Kurulum", text_color=color.white, bgcolor=cHdr, text_size=size.small)
+    table.cell(tb, 1, 3, setupL ? "HAZIR ✓" : "yok", text_color=color.white, bgcolor=setupL ? cBull : cNeu, text_size=size.small)
+    table.cell(tb, 2, 3, setupS ? "HAZIR ✓" : "yok", text_color=color.white, bgcolor=setupS ? cBear : cNeu, text_size=size.small)
+
+    table.cell(tb, 0, 4, "Kırılım seviyesi", text_color=color.white, bgcolor=cHdr, text_size=size.small)
+    table.cell(tb, 1, 4, highBroken ? "kırıldı, yeni tepe bekleniyor" : str.tostring(lastHigh, format.mintick), text_color=color.white, bgcolor=cNeu, text_size=size.small)
+    table.cell(tb, 2, 4, lowBroken ? "kırıldı, yeni dip bekleniyor" : str.tostring(lastLow, format.mintick), text_color=color.white, bgcolor=cNeu, text_size=size.small)
+
+    table.cell(tb, 0, 5, "1 CHoCH", text_color=color.white, bgcolor=cHdr, text_size=size.small)
+    table.cell(tb, 1, 5, msDir == -1 ? "yapı düşüşte ✓" : "—", text_color=color.white, bgcolor=msDir == -1 ? cBull : cNeu, text_size=size.small)
+    table.cell(tb, 2, 5, msDir == 1 ? "yapı yükselişte ✓" : "—", text_color=color.white, bgcolor=msDir == 1 ? cBear : cNeu, text_size=size.small)
+
+    table.cell(tb, 0, 6, "2 Bulut", text_color=color.white, bgcolor=cHdr, text_size=size.small)
+    table.cell(tb, 1, 6, cloudName(cPos), text_color=color.white, bgcolor=cPos == 1 ? cBull : cNeu, text_size=size.small)
+    table.cell(tb, 2, 6, cloudName(cPos), text_color=color.white, bgcolor=cPos == -1 ? cBear : cNeu, text_size=size.small)
+
+    table.cell(tb, 0, 7, "3 TK", text_color=color.white, bgcolor=cHdr, text_size=size.small)
+    table.cell(tb, 1, 7, tkL ? tkName(tkBuyTp) + " AL (" + str.tostring(bar_index - tkBuyBar) + " mum)" : "—", text_color=color.white, bgcolor=tkL ? cBull : cNeu, text_size=size.small)
+    table.cell(tb, 2, 7, tkS ? tkName(tkSellTp) + " SAT (" + str.tostring(bar_index - tkSellBar) + " mum)" : "—", text_color=color.white, bgcolor=tkS ? cBear : cNeu, text_size=size.small)
+
+    vTxt = na(vRat) ? "veri yok" : str.tostring(vRat, "#.##") + "x"
+    table.cell(tb, 0, 8, "4 Hacim", text_color=color.white, bgcolor=cHdr, text_size=size.small)
+    table.cell(tb, 1, 8, vTxt, text_color=color.white, bgcolor=vOk ? cBull : cNeu, text_size=size.small)
+    table.cell(tb, 2, 8, vTxt, text_color=color.white, bgcolor=vOk ? cBear : cNeu, text_size=size.small)
+
+    obTxt = obvTLtxt(obSup, obRes)
+    table.cell(tb, 0, 9, "5 OBV trend", text_color=color.white, bgcolor=cHdr, text_size=size.small)
+    table.cell(tb, 1, 9, obTxt, text_color=color.white, bgcolor=obvL ? cBull : cNeu, text_size=size.small)
+    table.cell(tb, 2, 9, obTxt, text_color=color.white, bgcolor=obvS ? cBear : cNeu, text_size=size.small)
+
+    table.cell(tb, 0, 10, "6 Uyumsuzluk", text_color=color.white, bgcolor=cHdr, text_size=size.small)
+    table.cell(tb, 1, 10, divL ? "pozitif" + (agoObU <= divWin ? " OBV" : "") + (agoTsU <= divWin ? " TSI" : "") : "—", text_color=color.white, bgcolor=divL ? cBull : cNeu, text_size=size.small)
+    table.cell(tb, 2, 10, divS ? "negatif" + (agoObD <= divWin ? " OBV" : "") + (agoTsD <= divWin ? " TSI" : "") : "—", text_color=color.white, bgcolor=divS ? cBear : cNeu, text_size=size.small)
+
+    table.cell(tb, 0, 11, "7 Üst TF " + htf1, text_color=color.white, bgcolor=cHdr, text_size=size.small)
+    table.cell(tb, 1, 11, not h1On ? "kapalı" : "OBV " + (nz(h1Bias) > 0 ? "↗" : nz(h1Bias) < 0 ? "↘" : "→") + " | bulut " + cloudName(h1Cld), text_color=color.white, bgcolor=h1L ? cBull : cNeu, text_size=size.small)
+    table.cell(tb, 2, 11, not h1On ? "kapalı" : "OBV " + (nz(h1Bias) > 0 ? "↗" : nz(h1Bias) < 0 ? "↘" : "→") + " | bulut " + cloudName(h1Cld), text_color=color.white, bgcolor=h1S ? cBear : cNeu, text_size=size.small)
+
+    table.cell(tb, 0, 12, "8 Üst TF " + htf2, text_color=color.white, bgcolor=cHdr, text_size=size.small)
+    table.cell(tb, 1, 12, not h2On ? "kapalı" : "OBV " + (nz(h2Bias) > 0 ? "↗" : nz(h2Bias) < 0 ? "↘" : "→") + " | bulut " + cloudName(h2Cld), text_color=color.white, bgcolor=h2L ? cBull : cNeu, text_size=size.small)
+    table.cell(tb, 2, 12, not h2On ? "kapalı" : "OBV " + (nz(h2Bias) > 0 ? "↗" : nz(h2Bias) < 0 ? "↘" : "→") + " | bulut " + cloudName(h2Cld), text_color=color.white, bgcolor=h2S ? cBear : cNeu, text_size=size.small)
+
+    table.cell(tb, 0, 13, "PUAN (gereken " + str.tostring(minScore) + ")", text_color=color.white, bgcolor=cHdr, text_size=size.small)
+    table.cell(tb, 1, 13, str.tostring(scNowL) + " / 8", text_color=color.white, bgcolor=scNowL >= minScore ? cBull : cNeu, text_size=size.small)
+    table.cell(tb, 2, 13, str.tostring(scNowS) + " / 8", text_color=color.white, bgcolor=scNowS >= minScore ? cBear : cNeu, text_size=size.small)
+
+    table.cell(tb, 0, 14, "Retest bekleniyor", text_color=color.white, bgcolor=cHdr, text_size=size.small)
+    table.cell(tb, 1, 14, rtL ? "@ " + str.tostring(rtLvL, format.mintick) : "—", text_color=color.white, bgcolor=rtL ? cSqz : cNeu, text_size=size.small)
+    table.cell(tb, 2, 14, rtS ? "@ " + str.tostring(rtLvS, format.mintick) : "—", text_color=color.white, bgcolor=rtS ? cSqz : cNeu, text_size=size.small)
+
+    posTxt = strategy.position_size > 0 ? "LONG | stop " + str.tostring(stopL, format.mintick) : strategy.position_size < 0 ? "SHORT | stop " + str.tostring(stopS, format.mintick) : "pozisyon yok"
+    table.cell(tb, 0, 15, "Pozisyon", text_color=color.white, bgcolor=cHdr, text_size=size.small)
+    table.cell(tb, 1, 15, posTxt, text_color=color.white, bgcolor=strategy.position_size > 0 ? cBull : strategy.position_size < 0 ? cBear : cNeu, text_size=size.small)

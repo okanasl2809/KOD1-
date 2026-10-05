@@ -1,0 +1,618 @@
+//@version=6
+indicator("MEMATİ • POLAT | 11 TF OBV Tablosu", shorttitle="SKR-11TF", overlay=true, max_labels_count=500)
+
+// =====================================================================
+//  ŞART 1 : Sıkışma (kırılımdan önce ya da kırılım anında)
+//           + kırmızının ÜSTÜNDE mum kapanışı
+//  ŞART 2 : Şart 1 + fiyat bulutun ÜSTÜNDE + TK GÜÇLÜ / ORTA ALIM
+//           (TK sinyali kırılımdan en fazla N mum önce ya da sonra)
+//    TK GÜÇLÜ ALIM: Tenkan Kijun'u alttan yukarı keser + Chikou bulutun üstünde
+//                   + kesişim bulutun ÜSTÜNDE + fiyat bulutun üstünde
+//    TK ORTA ALIM : aynı, kesişim bulutun İÇİNDE
+//  ŞART 3 : Şart 1/2 + HACİM ONAYI (kırılım mumunda ya da hacimli retestte)
+//  BİLGİ  : 11 zaman diliminde OBV alt/üst trend çizgisi + uyumsuzluk
+//
+//  Her şey KAPANMIŞ mumla hesaplanır. Tablo ve alarm mum kapanmadan değişmez.
+//  KURULUM: 15dk grafik → Alarm → Koşul "SKR-11TF" → "Any alert() function call"
+//
+//  BİLİNMESİ GEREKENLER
+//  • Bir zaman diliminin mum kapanışı, grafikteki bir SONRAKİ mum açılınca görülür.
+//    Borsa kapanınca kapanan günlük/haftalık mumların sinyali bir sonraki seans açılışında gelir.
+//  • Düşük zaman dilimli grafikte (15dk) yüklenen geçmiş kısadır; büyük zaman dilimlerinde
+//    (G, 3G, 5G, Hf) Ichimoku bulutu için yeterli mum olmayabilir → tabloda "veri yetersiz".
+// =====================================================================
+
+// =====================================================================
+// GİRDİLER
+// =====================================================================
+grpAL    = "Alarm"
+alertS1  = input.bool(true,  "Şart 1 alarmları (MEMATİ)", group=grpAL)
+alertS2  = input.bool(true,  "Şart 2 alarmları (POLAT)", group=grpAL)
+onlyVol  = input.bool(false, "Sadece hacim onaylıları gönder (Şart 3)", group=grpAL)
+sellOn   = input.bool(false, "Satış tarafı da (yeşil altı + TK güçlü/orta satış)", group=grpAL)
+showLbl  = input.bool(true,  "Grafikte sinyal etiketleri (alarmı kapalı TF'ler dahil)", group=grpAL)
+
+grpMS    = "Kırmızı / Yeşil Çizgi"
+pivotLen = input.int(5, "Swing pivot uzunluğu", minval=1, group=grpMS)
+
+grpSQ   = "Sıkışma (TTM Squeeze)"
+sqzLen  = input.int(20, "Uzunluk", minval=2, group=grpSQ)
+bbMult  = input.float(2.0, "Bollinger çarpanı", step=0.1, group=grpSQ)
+kcMult  = input.float(1.5, "Keltner çarpanı", step=0.1, group=grpSQ)
+minSqz  = input.int(5, "En az kaç mum sıkışma", minval=1, group=grpSQ)
+sqzLook = input.int(3, "Sıkışma bittikten sonra max mum", minval=0, group=grpSQ, tooltip="Kırılım sıkışma sürerken ya da bittikten en fazla bu kadar mum sonra gelmeli.")
+
+grpIC  = "Ichimoku"
+tenLen = input.int(9,  "Tenkan", minval=1, group=grpIC)
+kijLen = input.int(26, "Kijun", minval=1, group=grpIC)
+sbLen  = input.int(52, "Senkou B", minval=1, group=grpIC)
+disp   = input.int(26, "Kaydırma", minval=2, group=grpIC)
+tkWin  = input.int(10, "TK sinyali ile kırılım arası max mum", minval=0, group=grpIC, tooltip="TK güçlü/orta alım, kırılımdan en fazla bu kadar mum önce ya da sonra gelirse Şart 2 sayılır.")
+
+grpVL   = "Hacim (Şart 3)"
+volLen  = input.int(20, "Hacim ortalaması (mum)", minval=1, group=grpVL)
+volMult = input.float(1.5, "Ortalama hacmin en az kaç katı", minval=0.1, step=0.1, group=grpVL)
+
+grpRT     = "Retest"
+retestWin = input.int(20, "Kırılımdan sonra takip (mum)", minval=1, group=grpRT)
+atrLen    = input.int(14, "ATR uzunluğu", minval=1, group=grpRT)
+tolMult   = input.float(0.3, "Retest toleransı (x ATR)", minval=0, step=0.05, group=grpRT)
+failMult  = input.float(0.5, "Fake iptal eşiği (x ATR)", minval=0, step=0.05, group=grpRT)
+
+grpOB     = "OBV / Uyumsuzluk"
+obvPivLen = input.int(5, "OBV trend çizgisi pivot uzunluğu", minval=1, group=grpOB)
+obvMaxAge = input.int(100, "OBV trend çizgisi en fazla kaç mum geçerli", minval=10, group=grpOB, tooltip="Çizginin son dip/tepe noktası bundan eskiyse çizgi geçersiz sayılır.")
+divWin    = input.int(30, "Uyumsuzluk geçerlilik (mum)", minval=1, group=grpOB)
+divMinGap = input.int(5, "Uyumsuzluk: iki pivot arası en az mum", minval=1, group=grpOB)
+divMaxGap = input.int(60, "Uyumsuzluk: iki pivot arası en fazla mum", minval=2, group=grpOB, tooltip="Birbirine çok yakın ya da çok uzak iki tepe/dip arasındaki fark uyumsuzluk sayılmaz.")
+tsiLong   = input.int(25, "TSI Long", minval=1, group=grpOB)
+tsiShort  = input.int(13, "TSI Short", minval=1, group=grpOB)
+
+grpTF = "Zaman Dilimleri (kutucuk = alarm)"
+tf1  = input.timeframe("15", "TF 1", inline="t1", group=grpTF)
+al1  = input.bool(true, "alarm", inline="t1", group=grpTF)
+tf2  = input.timeframe("30", "TF 2", inline="t2", group=grpTF)
+al2  = input.bool(false, "alarm", inline="t2", group=grpTF)
+tf3  = input.timeframe("60", "TF 3", inline="t3", group=grpTF)
+al3  = input.bool(true, "alarm", inline="t3", group=grpTF)
+tf4  = input.timeframe("120", "TF 4", inline="t4", group=grpTF)
+al4  = input.bool(false, "alarm", inline="t4", group=grpTF)
+tf5  = input.timeframe("240", "TF 5", inline="t5", group=grpTF)
+al5  = input.bool(true, "alarm", inline="t5", group=grpTF)
+tf6  = input.timeframe("360", "TF 6", inline="t6", group=grpTF)
+al6  = input.bool(false, "alarm", inline="t6", group=grpTF)
+tf7  = input.timeframe("480", "TF 7", inline="t7", group=grpTF)
+al7  = input.bool(false, "alarm", inline="t7", group=grpTF)
+tf8  = input.timeframe("D", "TF 8", inline="t8", group=grpTF)
+al8  = input.bool(true, "alarm", inline="t8", group=grpTF)
+tf9  = input.timeframe("3D", "TF 9", inline="t9", group=grpTF)
+al9  = input.bool(false, "alarm", inline="t9", group=grpTF)
+tf10  = input.timeframe("5D", "TF 10", inline="t10", group=grpTF)
+al10  = input.bool(false, "alarm", inline="t10", group=grpTF)
+tf11  = input.timeframe("W", "TF 11", inline="t11", group=grpTF)
+al11  = input.bool(true, "alarm", inline="t11", group=grpTF)
+
+grpDS      = "Görünüm"
+showStruct = input.bool(true, "Kırmızı / yeşil çizgileri göster", group=grpDS)
+showTable  = input.bool(true, "Tablo", group=grpDS)
+tblPosStr  = input.string("Sağ Alt", "Tablo konumu", options=["Sağ Üst", "Sağ Alt", "Sol Üst", "Sol Alt"], group=grpDS)
+
+// =====================================================================
+// YARDIMCI FONKSİYONLAR
+// =====================================================================
+donchian(len) =>
+    math.avg(ta.lowest(len), ta.highest(len))
+
+// dk = dakika, s = saat, G = gün, Hf = hafta
+tfLbl(tf) =>
+    sec = timeframe.in_seconds(tf)
+    sec < 3600 ? str.tostring(math.round(sec / 60)) + "dk" : sec < 86400 ? str.tostring(math.round(sec / 3600)) + "s" : sec < 604800 ? str.tostring(math.round(sec / 86400)) + "G" : str.tostring(math.round(sec / 604800)) + "Hf"
+
+posTxt(p) =>
+    p == 1 ? "▲ Kırmızı üstü" : p == -1 ? "▼ Yeşil altı" : "● Arada"
+
+cloudName(cp) =>
+    na(cp) ? "—" : cp == 2 ? "veri yetersiz" : cp == 1 ? "ÜSTÜNDE" : cp == -1 ? "ALTINDA" : "İÇİNDE"
+
+tkName(t) =>
+    t == 2 ? "GÜÇLÜ AL" : t == 3 ? "ORTA AL" : t == -2 ? "GÜÇLÜ SAT" : t == -3 ? "ORTA SAT" : "—"
+
+// OBV trend çizgileri
+// sup: 0 yok, 1 OBV yükselen desteğin ÜSTÜNDE, 2 desteği AŞAĞI kırdı
+// res: 0 yok, 1 OBV alçalan direncin ALTINDA, 2 direnci YUKARI kırdı
+f_obvTL(src, len) =>
+    phO = ta.pivothigh(src, len, len)
+    plO = ta.pivotlow(src, len, len)
+    var float h1  = na
+    var int   hx1 = na
+    var float h2  = na
+    var int   hx2 = na
+    var float l1  = na
+    var int   lx1 = na
+    var float l2  = na
+    var int   lx2 = na
+    if not na(phO)
+        h1  := h2
+        hx1 := hx2
+        h2  := phO
+        hx2 := bar_index - len
+    if not na(plO)
+        l1  := l2
+        lx1 := lx2
+        l2  := plO
+        lx2 := bar_index - len
+    float supVal = na
+    float resVal = na
+    if not na(l1) and not na(l2) and l2 > l1 and lx2 > lx1 and bar_index - lx2 <= obvMaxAge
+        supVal := l2 + (l2 - l1) / (lx2 - lx1) * (bar_index - lx2)
+    if not na(h1) and not na(h2) and h2 < h1 and hx2 > hx1 and bar_index - hx2 <= obvMaxAge
+        resVal := h2 + (h2 - h1) / (hx2 - hx1) * (bar_index - hx2)
+    sup = na(supVal) ? 0 : src >= supVal ? 1 : 2
+    res = na(resVal) ? 0 : src <= resVal ? 1 : 2
+    [sup, res]
+
+obvTLtxt(u, r) =>
+    string t = ""
+    if u == 1
+        t += "Alt trend üstünde ↗"
+    if u == 2
+        t += "Alt trendi aşağı kırdı ↘"
+    if r == 1
+        t += (t == "" ? "" : " + ") + "Üst trend altında ↘"
+    if r == 2
+        t += (t == "" ? "" : " + ") + "Üst trendi yukarı kırdı ↗"
+    t == "" ? "Trend çizgisi yok" : t
+
+// +: yükselişi destekler, -: düşüşü destekler
+obvTLbias(u, r) =>
+    (u == 1 ? 1 : 0) + (r == 2 ? 1 : 0) - (u == 2 ? 1 : 0) - (r == 1 ? 1 : 0)
+
+// Fiyat pivotlarında osilatör uyumsuzluğu (pivotlar arası mesafe sınırlı)
+f_div(osc) =>
+    phD   = ta.pivothigh(pivotLen, pivotLen)
+    plD   = ta.pivotlow(pivotLen, pivotLen)
+    oscAt = osc[pivotLen]
+    x     = bar_index - pivotLen
+    var float pH  = na
+    var float pHo = na
+    var int   pHx = na
+    var float pLw = na
+    var float pLo = na
+    var int   pLx = na
+    bool bearD = false
+    bool bullD = false
+    if not na(phD)
+        if not na(pH) and x - pHx >= divMinGap and x - pHx <= divMaxGap and phD > pH and oscAt < pHo
+            bearD := true
+        pH  := phD
+        pHo := oscAt
+        pHx := x
+    if not na(plD)
+        if not na(pLw) and x - pLx >= divMinGap and x - pLx <= divMaxGap and plD < pLw and oscAt > pLo
+            bullD := true
+        pLw := plD
+        pLo := oscAt
+        pLx := x
+    [bearD, bullD]
+
+divName(c) =>
+    c == 1 ? "OBV" : c == 2 ? "TSI" : c == 3 ? "OBV+TSI" : ""
+
+divCell(bear, bull) =>
+    bear > 0 and bull > 0 ? "Negatif (" + divName(bear) + ") + Pozitif (" + divName(bull) + ")" : bear > 0 ? "Negatif (" + divName(bear) + ")" : bull > 0 ? "Pozitif (" + divName(bull) + ")" : "Yok"
+
+// Sinyal kodu: işaret = yön, yüzler = şart (1 Ş1, 2 Ş2 güçlü, 3 Ş2 orta),
+// onlar = tür (1 kırılım, 2 retest, 3 kırılım sonrası TK), birler = hacim onayı (1/0)
+evLevel(ev) =>
+    math.floor(math.abs(ev) / 100)
+
+evKind(ev) =>
+    math.floor((math.abs(ev) % 100) / 10)
+
+evVol(ev) =>
+    math.abs(ev) % 10
+
+sigShort(ev) =>
+    lv = evLevel(ev)
+    kd = evKind(ev)
+    (ev > 0 ? "▲ " : "▼ ") + (lv == 1 ? "MEMATİ" : lv == 2 ? "POLAT GÜÇLÜ" : "POLAT ORTA") + (kd == 2 ? " RETEST" : kd == 3 ? " +TK" : "") + (evVol(ev) == 1 ? " ✅" : "")
+
+// =====================================================================
+// BİR ZAMAN DİLİMİNİN TÜM HESABI (her TF'de aynı mantık)
+// =====================================================================
+f_state() =>
+    // ---------- Kırmızı / yeşil çizgi ve kırılım ----------
+    phS = ta.pivothigh(pivotLen, pivotLen)
+    plS = ta.pivotlow(pivotLen, pivotLen)
+    var float hiLvl = na
+    var float loLvl = na
+    var bool  hiBrk = false
+    var bool  loBrk = false
+    bool  bBrk = false
+    bool  sBrk = false
+    float bLvl = na
+    float sLvl = na
+    if not na(phS)
+        hiLvl := phS
+        hiBrk := false
+    if not na(plS)
+        loLvl := plS
+        loBrk := false
+    if not na(hiLvl) and not hiBrk and close > hiLvl
+        hiBrk := true
+        bBrk  := true
+        bLvl  := hiLvl
+    if not na(loLvl) and not loBrk and close < loLvl
+        loBrk := true
+        sBrk  := true
+        sLvl  := loLvl
+    pos = not na(hiLvl) and close > hiLvl ? 1 : not na(loLvl) and close < loLvl ? -1 : 0
+
+    // ---------- Sıkışma ----------
+    dev = bbMult * ta.stdev(close, sqzLen)
+    rng = kcMult * ta.sma(ta.tr(true), sqzLen)
+    sqz = dev < rng
+    var int sRun    = 0
+    var int sEndBar = na
+    var int sEndLen = 0
+    if sqz
+        sRun += 1
+    else
+        if sRun > 0
+            sEndBar := bar_index - 1
+            sEndLen := sRun
+        sRun := 0
+    sqzAct = sqz and sRun >= minSqz
+    sqzRec = not na(sEndBar) and bar_index - sEndBar <= sqzLook and sEndLen >= minSqz
+    sqzOk  = sqzAct or sqzRec
+    sqzN   = sqzAct ? sRun : sqzRec ? sEndLen : sRun
+
+    // ---------- Hacim (ortalama, mevcut mum hariç) ----------
+    vAvg = ta.sma(volume, volLen)[1]
+    vRat = nz(vAvg) > 0 ? volume / vAvg : na
+    vOk  = not na(vRat) and vRat >= volMult
+
+    // ---------- OBV trend çizgisi + uyumsuzluk ----------
+    [obSup, obRes] = f_obvTL(ta.obv, obvPivLen)
+    pc   = ta.change(close)
+    tsiV = 100 * ta.ema(ta.ema(pc, tsiLong), tsiShort) / ta.ema(ta.ema(math.abs(pc), tsiLong), tsiShort)
+    [obBD, obUD] = f_div(ta.obv)
+    [tsBD, tsUD] = f_div(tsiV)
+    dvBear = (nz(ta.barssince(obBD), 100000) <= divWin ? 1 : 0) + (nz(ta.barssince(tsBD), 100000) <= divWin ? 2 : 0)
+    dvBull = (nz(ta.barssince(obUD), 100000) <= divWin ? 1 : 0) + (nz(ta.barssince(tsUD), 100000) <= divWin ? 2 : 0)
+
+    // ---------- Ichimoku ----------
+    ten  = donchian(tenLen)
+    kij  = donchian(kijLen)
+    sA   = math.avg(ten, kij)
+    sB   = donchian(sbLen)
+    d1   = disp - 1
+    cTop = math.max(sA[d1], sB[d1])
+    cBot = math.min(sA[d1], sB[d1])
+    cHas = not na(cTop) and not na(cBot)
+    cPos = not cHas ? 2 : close > cTop ? 1 : close < cBot ? -1 : 0
+    // Chikou (bugünkü kapanış, d1 mum geride çizilir) → o noktadaki bulut
+    chTop = math.max(sA[2 * d1], sB[2 * d1])
+    chBot = math.min(sA[2 * d1], sB[2 * d1])
+    chHas = not na(chTop) and not na(chBot)
+    tkUp  = ta.crossover(ten, kij)
+    tkDn  = ta.crossunder(ten, kij)
+    xLvl  = math.avg(ten, kij)
+    xPos  = not cHas ? 2 : xLvl > cTop ? 1 : xLvl < cBot ? -1 : 0
+    // 2 = güçlü, 3 = orta
+    tkBuy  = (tkUp and chHas and close > chTop and cPos == 1) ? (xPos == 1 ? 2 : xPos == 0 ? 3 : 0) : 0
+    tkSell = (tkDn and chHas and close < chBot and cPos == -1) ? (xPos == -1 ? 2 : xPos == 0 ? 3 : 0) : 0
+    var int tkLastType = 0
+    var int tkLastBar  = na
+    if tkBuy > 0
+        tkLastType := tkBuy
+        tkLastBar  := bar_index
+    if tkSell > 0
+        tkLastType := -tkSell
+        tkLastBar  := bar_index
+    tkAgo = na(tkLastBar) ? -1 : bar_index - tkLastBar
+
+    // ---------- Kırılım takibi: ALIM ----------
+    atrS = ta.atr(atrLen)
+    var int   uAct = 0
+    var float uLv  = na
+    var int   uBar = na
+    var int   uLvl = 0
+    var bool  uVol = false
+    var bool  uRt  = false
+    var int   uSqN = 0
+    int   uEv = 0
+    float uEl = na
+    int   uEs = 0
+    if uAct == 1
+        if close < uLv - failMult * atrS or bar_index - uBar > retestWin
+            uAct := 0
+        else
+            lateTk = uLvl == 1 and tkBuy > 0 and bar_index - uBar <= tkWin and close > uLv
+            rtHit  = not uRt and bar_index > uBar and low <= uLv + tolMult * atrS and close > uLv and vOk
+            if lateTk
+                uLvl := tkBuy
+                uEv  := uLvl * 100 + 30 + (uVol ? 1 : 0)
+            else if rtHit
+                uRt  := true
+                uVol := true
+                uEv  := uLvl * 100 + 21
+            if uEv != 0
+                uEl := uLv
+                uEs := uSqN
+
+    // ---------- Kırılım takibi: SATIŞ ----------
+    var int   dAct = 0
+    var float dLv  = na
+    var int   dBar = na
+    var int   dLvl = 0
+    var bool  dVol = false
+    var bool  dRt  = false
+    var int   dSqN = 0
+    int   dEv = 0
+    float dEl = na
+    int   dEs = 0
+    if sellOn and dAct == 1
+        if close > dLv + failMult * atrS or bar_index - dBar > retestWin
+            dAct := 0
+        else
+            lateTkD = dLvl == 1 and tkSell > 0 and bar_index - dBar <= tkWin and close < dLv
+            rtHitD  = not dRt and bar_index > dBar and high >= dLv - tolMult * atrS and close < dLv and vOk
+            if lateTkD
+                dLvl := tkSell
+                dEv  := -(dLvl * 100 + 30 + (dVol ? 1 : 0))
+            else if rtHitD
+                dRt  := true
+                dVol := true
+                dEv  := -(dLvl * 100 + 21)
+            if dEv != 0
+                dEl := dLv
+                dEs := dSqN
+
+    // ---------- Yeni kırılımlar (sadece sıkışma sonrası) ----------
+    if bBrk and sqzOk
+        tkPre = tkLastType > 0 and tkAgo >= 0 and tkAgo <= tkWin and cPos == 1
+        uAct := 1
+        uLv  := bLvl
+        uBar := bar_index
+        uLvl := tkPre ? tkLastType : 1
+        uVol := vOk
+        uRt  := false
+        uSqN := sqzN
+        uEv  := uLvl * 100 + 10 + (vOk ? 1 : 0)
+        uEl  := bLvl
+        uEs  := sqzN
+        dAct := 0
+    if sellOn and sBrk and sqzOk
+        tkPreD = tkLastType < 0 and tkAgo >= 0 and tkAgo <= tkWin and cPos == -1
+        dAct := 1
+        dLv  := sLvl
+        dBar := bar_index
+        dLvl := tkPreD ? -tkLastType : 1
+        dVol := vOk
+        dRt  := false
+        dSqN := sqzN
+        dEv  := -(dLvl * 100 + 10 + (vOk ? 1 : 0))
+        dEl  := sLvl
+        dEs  := sqzN
+        uAct := 0
+
+    evt   = uEv != 0 ? uEv : dEv
+    eLvl  = uEv != 0 ? uEl : dEl
+    eSq   = uEv != 0 ? uEs : dEs
+    act   = uAct == 1 and not uRt ? 1 : dAct == 1 and not dRt ? -1 : 0
+    actLv = act == 1 ? uLv : act == -1 ? dLv : na
+    actTp = act == 1 ? uLvl : act == -1 ? dLvl : 0
+
+    [pos, sqz ? 1 : 0, sqzOk ? 1 : 0, sqzN, cPos, tkLastType, tkAgo, obSup, obRes, dvBear, dvBull, evt, eLvl, vRat, eSq, close, hiLvl, loLvl, act, actLv, actTp]
+
+// Son KAPANMIŞ mumun değerleri (+ o mumun zamanı)
+f_get() =>
+    [a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21] = f_state()
+    [time[1], a1[1], a2[1], a3[1], a4[1], a5[1], a6[1], a7[1], a8[1], a9[1], a10[1], a11[1], a12[1], a13[1], a14[1], a15[1], a16[1], a17[1], a18[1], a19[1], a20[1], a21[1]]
+
+// =====================================================================
+// 11 ZAMAN DİLİMİ (hepsi kapanmış mum)
+// =====================================================================
+[r1t, r1p, r1q, r1k, r1n, r1c, r1tk, r1ta, r1u, r1r, r1x, r1y, r1e, r1l, r1v, r1s, r1cl, r1hi, r1lo, r1w, r1wl, r1wt] = request.security(syminfo.tickerid, tf1, f_get(), lookahead=barmerge.lookahead_on)
+[r2t, r2p, r2q, r2k, r2n, r2c, r2tk, r2ta, r2u, r2r, r2x, r2y, r2e, r2l, r2v, r2s, r2cl, r2hi, r2lo, r2w, r2wl, r2wt] = request.security(syminfo.tickerid, tf2, f_get(), lookahead=barmerge.lookahead_on)
+[r3t, r3p, r3q, r3k, r3n, r3c, r3tk, r3ta, r3u, r3r, r3x, r3y, r3e, r3l, r3v, r3s, r3cl, r3hi, r3lo, r3w, r3wl, r3wt] = request.security(syminfo.tickerid, tf3, f_get(), lookahead=barmerge.lookahead_on)
+[r4t, r4p, r4q, r4k, r4n, r4c, r4tk, r4ta, r4u, r4r, r4x, r4y, r4e, r4l, r4v, r4s, r4cl, r4hi, r4lo, r4w, r4wl, r4wt] = request.security(syminfo.tickerid, tf4, f_get(), lookahead=barmerge.lookahead_on)
+[r5t, r5p, r5q, r5k, r5n, r5c, r5tk, r5ta, r5u, r5r, r5x, r5y, r5e, r5l, r5v, r5s, r5cl, r5hi, r5lo, r5w, r5wl, r5wt] = request.security(syminfo.tickerid, tf5, f_get(), lookahead=barmerge.lookahead_on)
+[r6t, r6p, r6q, r6k, r6n, r6c, r6tk, r6ta, r6u, r6r, r6x, r6y, r6e, r6l, r6v, r6s, r6cl, r6hi, r6lo, r6w, r6wl, r6wt] = request.security(syminfo.tickerid, tf6, f_get(), lookahead=barmerge.lookahead_on)
+[r7t, r7p, r7q, r7k, r7n, r7c, r7tk, r7ta, r7u, r7r, r7x, r7y, r7e, r7l, r7v, r7s, r7cl, r7hi, r7lo, r7w, r7wl, r7wt] = request.security(syminfo.tickerid, tf7, f_get(), lookahead=barmerge.lookahead_on)
+[r8t, r8p, r8q, r8k, r8n, r8c, r8tk, r8ta, r8u, r8r, r8x, r8y, r8e, r8l, r8v, r8s, r8cl, r8hi, r8lo, r8w, r8wl, r8wt] = request.security(syminfo.tickerid, tf8, f_get(), lookahead=barmerge.lookahead_on)
+[r9t, r9p, r9q, r9k, r9n, r9c, r9tk, r9ta, r9u, r9r, r9x, r9y, r9e, r9l, r9v, r9s, r9cl, r9hi, r9lo, r9w, r9wl, r9wt] = request.security(syminfo.tickerid, tf9, f_get(), lookahead=barmerge.lookahead_on)
+[r10t, r10p, r10q, r10k, r10n, r10c, r10tk, r10ta, r10u, r10r, r10x, r10y, r10e, r10l, r10v, r10s, r10cl, r10hi, r10lo, r10w, r10wl, r10wt] = request.security(syminfo.tickerid, tf10, f_get(), lookahead=barmerge.lookahead_on)
+[r11t, r11p, r11q, r11k, r11n, r11c, r11tk, r11ta, r11u, r11r, r11x, r11y, r11e, r11l, r11v, r11s, r11cl, r11hi, r11lo, r11w, r11wl, r11wt] = request.security(syminfo.tickerid, tf11, f_get(), lookahead=barmerge.lookahead_on)
+
+NTF    = 11
+curSec = timeframe.in_seconds()
+aLbl = array.from(tfLbl(tf1), tfLbl(tf2), tfLbl(tf3), tfLbl(tf4), tfLbl(tf5), tfLbl(tf6), tfLbl(tf7), tfLbl(tf8), tfLbl(tf9), tfLbl(tf10), tfLbl(tf11))
+aAL  = array.from(al1, al2, al3, al4, al5, al6, al7, al8, al9, al10, al11)
+aV   = array.from(timeframe.in_seconds(tf1) >= curSec, timeframe.in_seconds(tf2) >= curSec, timeframe.in_seconds(tf3) >= curSec, timeframe.in_seconds(tf4) >= curSec, timeframe.in_seconds(tf5) >= curSec, timeframe.in_seconds(tf6) >= curSec, timeframe.in_seconds(tf7) >= curSec, timeframe.in_seconds(tf8) >= curSec, timeframe.in_seconds(tf9) >= curSec, timeframe.in_seconds(tf10) >= curSec, timeframe.in_seconds(tf11) >= curSec)
+aCur = array.from(timeframe.in_seconds(tf1) == curSec, timeframe.in_seconds(tf2) == curSec, timeframe.in_seconds(tf3) == curSec, timeframe.in_seconds(tf4) == curSec, timeframe.in_seconds(tf5) == curSec, timeframe.in_seconds(tf6) == curSec, timeframe.in_seconds(tf7) == curSec, timeframe.in_seconds(tf8) == curSec, timeframe.in_seconds(tf9) == curSec, timeframe.in_seconds(tf10) == curSec, timeframe.in_seconds(tf11) == curSec)
+aNB  = array.from(r1t != nz(r1t[1]), r2t != nz(r2t[1]), r3t != nz(r3t[1]), r4t != nz(r4t[1]), r5t != nz(r5t[1]), r6t != nz(r6t[1]), r7t != nz(r7t[1]), r8t != nz(r8t[1]), r9t != nz(r9t[1]), r10t != nz(r10t[1]), r11t != nz(r11t[1]))
+aT = array.from(r1t, r2t, r3t, r4t, r5t, r6t, r7t, r8t, r9t, r10t, r11t)
+aP = array.from(r1p, r2p, r3p, r4p, r5p, r6p, r7p, r8p, r9p, r10p, r11p)
+aQ = array.from(r1q, r2q, r3q, r4q, r5q, r6q, r7q, r8q, r9q, r10q, r11q)
+aK = array.from(r1k, r2k, r3k, r4k, r5k, r6k, r7k, r8k, r9k, r10k, r11k)
+aN = array.from(r1n, r2n, r3n, r4n, r5n, r6n, r7n, r8n, r9n, r10n, r11n)
+aC = array.from(r1c, r2c, r3c, r4c, r5c, r6c, r7c, r8c, r9c, r10c, r11c)
+aTk = array.from(r1tk, r2tk, r3tk, r4tk, r5tk, r6tk, r7tk, r8tk, r9tk, r10tk, r11tk)
+aTa = array.from(r1ta, r2ta, r3ta, r4ta, r5ta, r6ta, r7ta, r8ta, r9ta, r10ta, r11ta)
+aU = array.from(r1u, r2u, r3u, r4u, r5u, r6u, r7u, r8u, r9u, r10u, r11u)
+aR = array.from(r1r, r2r, r3r, r4r, r5r, r6r, r7r, r8r, r9r, r10r, r11r)
+aX = array.from(r1x, r2x, r3x, r4x, r5x, r6x, r7x, r8x, r9x, r10x, r11x)
+aY = array.from(r1y, r2y, r3y, r4y, r5y, r6y, r7y, r8y, r9y, r10y, r11y)
+aE = array.from(r1e, r2e, r3e, r4e, r5e, r6e, r7e, r8e, r9e, r10e, r11e)
+aEl = array.from(r1l, r2l, r3l, r4l, r5l, r6l, r7l, r8l, r9l, r10l, r11l)
+aVr = array.from(r1v, r2v, r3v, r4v, r5v, r6v, r7v, r8v, r9v, r10v, r11v)
+aEs = array.from(r1s, r2s, r3s, r4s, r5s, r6s, r7s, r8s, r9s, r10s, r11s)
+aCl = array.from(r1cl, r2cl, r3cl, r4cl, r5cl, r6cl, r7cl, r8cl, r9cl, r10cl, r11cl)
+aW = array.from(r1w, r2w, r3w, r4w, r5w, r6w, r7w, r8w, r9w, r10w, r11w)
+aWl = array.from(r1wl, r2wl, r3wl, r4wl, r5wl, r6wl, r7wl, r8wl, r9wl, r10wl, r11wl)
+aWt = array.from(r1wt, r2wt, r3wt, r4wt, r5wt, r6wt, r7wt, r8wt, r9wt, r10wt, r11wt)
+
+// =====================================================================
+// MESAJ
+// =====================================================================
+f_tfBlock() =>
+    string s = "\n\n— OBV TREND ÇİZGİSİ / UYUMSUZLUK (kapanmış mum) —"
+    for j = 0 to NTF - 1
+        if array.get(aV, j)
+            s += "\n" + array.get(aLbl, j) + ": " + obvTLtxt(array.get(aU, j), array.get(aR, j)) + " | Uyumsuzluk: " + divCell(array.get(aX, j), array.get(aY, j))
+    s
+
+f_summary(up) =>
+    sg = up ? 1 : -1
+    string good  = ""
+    string bad   = ""
+    string dvBad = ""
+    string dvGud = ""
+    for j = 0 to NTF - 1
+        if array.get(aV, j)
+            b = obvTLbias(array.get(aU, j), array.get(aR, j)) * sg
+            if b > 0
+                good += array.get(aLbl, j) + " "
+            if b < 0
+                bad += array.get(aLbl, j) + " "
+            if (up ? array.get(aX, j) : array.get(aY, j)) > 0
+                dvBad += array.get(aLbl, j) + " "
+            if (up ? array.get(aY, j) : array.get(aX, j)) > 0
+                dvGud += array.get(aLbl, j) + " "
+    "\n\n— ÖZET —" +
+     (good  != "" ? "\n✅ OBV trendi destekliyor: " + good : "") +
+     (dvGud != "" ? "\n✅ " + (up ? "Pozitif" : "Negatif") + " uyumsuzluk: " + dvGud : "") +
+     (bad   != "" ? "\n⚠️ OBV trendi ters: " + bad : "") +
+     (dvBad != "" ? "\n⚠️ " + (up ? "Negatif" : "Pozitif") + " uyumsuzluk: " + dvBad : "") +
+     (bad == "" and dvBad == "" ? "\n✅ Ters sinyal yok" : "")
+
+f_msg(i, ev) =>
+    up    = ev > 0
+    lv    = evLevel(ev)
+    kd    = evKind(ev)
+    vo    = evVol(ev)
+    side  = up ? "kırmızı üstü kapanış" : "yeşil altı kapanış"
+    name  = lv == 1 ? "MEMATİ" : "POLAT"
+    title = lv == 1 ? "Şart 1: Sıkışma + " + side : "Şart 2: Sıkışma + " + side + " + bulut " + (up ? "üstü" : "altı") + " + TK " + (lv == 2 ? "GÜÇLÜ" : "ORTA") + (up ? " ALIM" : " SATIŞ")
+    kindT = kd == 1 ? "Kırılım mumu kapandı" : kd == 2 ? "RETEST: seviyeye döndü, " + (up ? "üstünde" : "altında") + " hacimli kapandı" : "Kırılımdan sonra TK " + (lv == 2 ? "güçlü" : "orta") + (up ? " alım" : " satış") + " sinyali geldi"
+    volT  = vo == 1 ? "ŞART 3 ✅ HACİM ONAYLI" : "hacim onayı YOK (hacimli retest gelirse ayrıca uyarı gelir)"
+    vr    = array.get(aVr, i)
+    name + (lv >= 2 ? " ⭐" : "") + (up ? " 🚀 " : " 🔻 ") + syminfo.ticker + " " + array.get(aLbl, i) + " — " + title +
+     "\n" + kindT +
+     "\nSeviye: " + str.tostring(array.get(aEl, i), format.mintick) + " | Kapanış: " + str.tostring(array.get(aCl, i), format.mintick) +
+     "\nHacim: " + (na(vr) ? "veri yok" : str.tostring(vr, "#.##") + "x ortalama") + " → " + volT +
+     "\nSıkışma: " + str.tostring(array.get(aEs, i)) + " mum" +
+     "\nBulut: " + cloudName(array.get(aC, i))
+
+// =====================================================================
+// ALARM: bir TF'nin mumu kapandığında, o mumda sinyal varsa.
+// Aynı anda birden fazla sinyal olursa hepsi TEK bildirimde gelir.
+// =====================================================================
+// Pine'da bir yazı en fazla 4096 karakter olabilir; mesaj bu sınırın altında tutulur.
+MSG_MAX = 2600
+SEP     = "\n━━━━━━━━━━━━\n"
+var array<string> lastSig = array.new_string(NTF, "—")
+string allMsg  = ""
+int    skipped = 0
+bool   anyUp   = false
+bool   anyDn   = false
+for i = 0 to NTF - 1
+    if array.get(aV, i) and array.get(aNB, i)
+        ev = nz(array.get(aE, i))
+        if ev != 0
+            lv     = evLevel(ev)
+            lvOk   = (lv == 1 ? alertS1 : alertS2) and (not onlyVol or evVol(ev) == 1)
+            sigNow = sigShort(ev)
+            array.set(lastSig, i, sigNow + " · " + str.format_time(array.get(aT, i), "dd.MM HH:mm", "Europe/Istanbul"))
+            if lvOk
+                m = f_msg(i, ev)
+                // Bildirim sadece alarm kutucuğu işaretli TF'ler için
+                if array.get(aAL, i)
+                    if str.length(allMsg) + str.length(m) + 20 <= MSG_MAX
+                        allMsg += (allMsg == "" ? "" : SEP) + m
+                    else
+                        skipped += 1
+                    anyUp := anyUp or ev > 0
+                    anyDn := anyDn or ev < 0
+                // Etiket alarm kutucuğundan bağımsız (tablodaki her sinyal grafikte de görünsün)
+                if showLbl
+                    lc = lv == 1 ? (ev > 0 ? color.new(#26A69A, 0) : color.new(#EF5350, 0)) : (ev > 0 ? color.new(#00C853, 0) : color.new(#D50000, 0))
+                    label.new(bar_index, ev > 0 ? low : high, array.get(aLbl, i) + " " + sigNow, yloc=ev > 0 ? yloc.belowbar : yloc.abovebar, style=ev > 0 ? label.style_label_up : label.style_label_down, color=lc, textcolor=color.white, size=size.small, tooltip=m)
+
+if allMsg != ""
+    string full = allMsg + (skipped > 0 ? "\n(+" + str.tostring(skipped) + " sinyal daha — tabloya bak)" : "")
+    tailTxt = f_tfBlock() + (anyUp ? f_summary(true) : "") + (anyDn ? f_summary(false) : "")
+    if str.length(full) + str.length(tailTxt) <= 4000
+        full += tailTxt
+    else
+        full += "\n\n(OBV/uyumsuzluk detayı için tabloya bak)"
+    alert(full, alert.freq_once_per_bar)
+
+// =====================================================================
+// ÇİZGİLER (grafiğin kendi zaman dilimi, sadece kapanmış mumlar)
+// =====================================================================
+[gP, gQ, gK, gN, gC, gTk, gTa, gU, gR, gX, gY, gE, gL, gV, gS, gCl, gHi, gLo, gW, gWl, gWt] = f_state()
+plot(showStruct ? gHi[1] : na, "Kırmızı (swing high)", color=color.new(color.red,   30), style=plot.style_stepline, linewidth=2, offset=-1)
+plot(showStruct ? gLo[1] : na, "Yeşil (swing low)",    color=color.new(color.green, 30), style=plot.style_stepline, linewidth=2, offset=-1)
+plot(gW[1] != 0 ? gWl[1] : na, "Retest bekleniyor",  color=color.new(color.aqua, 0),   style=plot.style_linebr, linewidth=1, offset=-1)
+bgcolor(gQ[1] == 1 and gK[1] == 1 ? color.new(color.orange, 90) : na, title="Sıkışma (geçerli)", offset=-1)
+
+// =====================================================================
+// TABLO (açık coinin durumu, sadece kapanmış mumlar)
+// =====================================================================
+tblPos = tblPosStr == "Sağ Üst" ? position.top_right : tblPosStr == "Sağ Alt" ? position.bottom_right : tblPosStr == "Sol Üst" ? position.top_left : position.bottom_left
+var table tbl = table.new(tblPos, 10, NTF + 3, border_width=1, frame_color=color.new(color.gray, 50), frame_width=1)
+
+if barstate.isfirst
+    table.merge_cells(tbl, 0, NTF + 1, 9, NTF + 1)
+    table.merge_cells(tbl, 0, NTF + 2, 9, NTF + 2)
+
+cBull = color.new(#26A69A, 30)
+cBear = color.new(#EF5350, 30)
+cNeu  = color.new(color.gray, 60)
+cHdr  = color.new(color.gray, 25)
+cSqz  = color.new(color.orange, 30)
+cOff  = color.new(color.gray, 85)
+
+if showTable and barstate.islast
+    hdr = array.from("TF", "Alarm", "Konum", "Sıkışma", "Bulut", "TK (son sinyal)", "OBV Trend Çizgisi", "Uyumsuzluk", "Retest bekliyor", "Son sinyal")
+    for c = 0 to 9
+        table.cell(tbl, c, 0, array.get(hdr, c), text_color=color.white, bgcolor=cHdr, text_size=size.small)
+    string waitAll = ""
+    for i = 0 to NTF - 1
+        r = i + 1
+        table.cell(tbl, 0, r, array.get(aLbl, i) + (array.get(aCur, i) ? " •" : ""), text_color=color.white, bgcolor=cHdr, text_size=size.small)
+        if array.get(aV, i)
+            p  = array.get(aP, i)
+            q  = array.get(aQ, i)
+            k  = array.get(aK, i)
+            cp = array.get(aC, i)
+            tk = array.get(aTk, i)
+            tg = array.get(aTa, i)
+            u  = array.get(aU, i)
+            rr = array.get(aR, i)
+            x  = array.get(aX, i)
+            y  = array.get(aY, i)
+            w  = array.get(aW, i)
+            bi = obvTLbias(u, rr)
+            tkShow = tk != 0 and tg >= 0 and tg <= 50
+            table.cell(tbl, 1, r, array.get(aAL, i) ? "🔔" : "—", text_color=color.white, bgcolor=cNeu, text_size=size.small)
+            table.cell(tbl, 2, r, posTxt(p), text_color=color.white, bgcolor=p == 1 ? cBull : p == -1 ? cBear : cNeu, text_size=size.small)
+            table.cell(tbl, 3, r, q == 1 ? "SIKIŞMA (" + str.tostring(array.get(aN, i)) + ")" : k == 1 ? "yeni bitti" : "—", text_color=color.white, bgcolor=q == 1 or k == 1 ? cSqz : cNeu, text_size=size.small)
+            table.cell(tbl, 4, r, cloudName(cp), text_color=color.white, bgcolor=cp == 1 ? cBull : cp == -1 ? cBear : cNeu, text_size=size.small)
+            table.cell(tbl, 5, r, tkShow ? tkName(tk) + " (" + str.tostring(tg) + " mum önce)" : "—", text_color=color.white, bgcolor=tkShow ? (tk > 0 ? cBull : cBear) : cNeu, text_size=size.small)
+            table.cell(tbl, 6, r, obvTLtxt(u, rr), text_color=color.white, bgcolor=bi > 0 ? cBull : bi < 0 ? cBear : cNeu, text_size=size.small)
+            table.cell(tbl, 7, r, divCell(x, y), text_color=color.white, bgcolor=x > 0 and y == 0 ? cBear : y > 0 and x == 0 ? cBull : x > 0 and y > 0 ? cSqz : cNeu, text_size=size.small)
+            wTxt = w == 1 ? "▲ @ " + str.tostring(array.get(aWl, i), format.mintick) : w == -1 ? "▼ @ " + str.tostring(array.get(aWl, i), format.mintick) : "—"
+            table.cell(tbl, 8, r, wTxt, text_color=color.white, bgcolor=w == 1 ? cBull : w == -1 ? cBear : cNeu, text_size=size.small)
+            table.cell(tbl, 9, r, array.get(lastSig, i), text_color=color.white, bgcolor=cNeu, text_size=size.small)
+            if w != 0
+                waitAll += array.get(aLbl, i) + " " + wTxt + "   "
+        else
+            table.cell(tbl, 1, r, "grafik TF'sinden küçük", text_color=color.gray, bgcolor=cOff, text_size=size.small)
+            for c = 2 to 9
+                table.cell(tbl, c, r, "—", text_color=color.gray, bgcolor=cOff, text_size=size.small)
+    table.cell(tbl, 0, NTF + 1, waitAll == "" ? "Retest bekleyen kırılım yok" : "⏳ Hacimli retest bekleniyor: " + waitAll, text_color=color.white, bgcolor=waitAll == "" ? cNeu : cSqz, text_size=size.small)
+    table.cell(tbl, 0, NTF + 2, "Tüm değerler KAPANMIŞ mumdan. Bir satır, sadece o zaman diliminde mum kapanınca değişir.  • = grafiğin zaman dilimi", text_color=color.gray, bgcolor=cOff, text_size=size.tiny)
