@@ -1,0 +1,87 @@
+//@version=6
+indicator("TSI Oversold → Bullish CHoCH", shorttitle="TSI+CHoCH", overlay=true)
+
+// ============ GİRDİLER ============
+// --- TSI ---
+grpTSI    = "TSI Ayarları"
+longLen   = input.int(25,  "TSI Long Length",  minval=1, group=grpTSI)
+shortLen  = input.int(13,  "TSI Short Length", minval=1, group=grpTSI)
+tsiThresh = input.float(-35, "Oversold Eşiği", group=grpTSI)
+
+// --- Piyasa Yapısı ---
+grpMS    = "Piyasa Yapısı (CHoCH)"
+pivotLen = input.int(5, "Swing Pivot Uzunluğu", minval=1, group=grpMS, tooltip="Swing high/low tespiti için sol/sağ bar sayısı. Küçük değer = daha hassas/daha çok sinyal, büyük değer = daha büyük yapı.")
+
+// --- Sinyal ---
+grpSig  = "Sinyal"
+maxWait = input.int(50, "Oversold → CHoCH max bar (0 = sınırsız)", minval=0, group=grpSig, tooltip="TSI eşiğin altına düştükten sonra CHoCH kırılımı için beklenecek maksimum bar sayısı. Süre aşılırsa kurulum iptal olur.")
+
+// --- Görünüm ---
+grpDisp    = "Görünüm"
+showStruct = input.bool(true, "Swing seviyelerini göster", group=grpDisp)
+showTable  = input.bool(true, "TSI değer kutusu", group=grpDisp)
+
+// ============ TSI HESABI ============
+double_smooth(src, l, s) =>
+    ta.ema(ta.ema(src, l), s)
+
+pc        = ta.change(close)
+tsi_value = 100 * (double_smooth(pc, longLen, shortLen) / double_smooth(math.abs(pc), longLen, shortLen))
+
+// ============ PİYASA YAPISI / CHoCH ============
+ph = ta.pivothigh(pivotLen, pivotLen)
+pl = ta.pivotlow(pivotLen, pivotLen)
+
+var float lastHigh = na    // kırılması gereken son swing high
+var float lastLow  = na    // son swing low
+var int   msDir    = 0     // 1 = bullish, -1 = bearish, 0 = nötr
+
+if not na(ph)
+    lastHigh := ph
+if not na(pl)
+    lastLow := pl
+
+bullBreak = not na(lastHigh) and ta.crossover(close, lastHigh)
+bearBreak = not na(lastLow)  and ta.crossunder(close, lastLow)
+
+// Yukarı yönlü CHoCH = yapı bearish/nötr iken son swing high'ın kapanışla kırılması
+bullCHoCH = bullBreak and msDir <= 0
+
+if bullBreak
+    msDir := 1
+if bearBreak
+    msDir := -1
+
+// ============ BİRLEŞİK SİNYAL ============
+// TSI -35'in altına düştü (kuruldu) → sonrasında yukarı CHoCH oluştu mu?
+var int barsSince = -1     // -1 = kurulu değil
+
+if tsi_value < tsiThresh
+    barsSince := 0
+else if barsSince >= 0
+    barsSince += 1
+
+armed  = barsSince >= 0 and (maxWait == 0 or barsSince <= maxWait)
+signal = armed and bullCHoCH
+
+if signal
+    barsSince := -1        // sinyal ateşlenince kurulumu sıfırla
+
+// ============ ÇİZİMLER ============
+plot(showStruct and not na(lastHigh) ? lastHigh : na, "Swing High", color=color.new(color.red,   40), style=plot.style_stepline)
+plot(showStruct and not na(lastLow)  ? lastLow  : na, "Swing Low",  color=color.new(color.green, 40), style=plot.style_stepline)
+
+plotshape(signal, title="Sinyal", style=shape.triangleup, location=location.belowbar, color=color.new(#26A69A, 0), size=size.small, text="CHoCH▲", textcolor=color.white)
+
+// Kurulum aktifken (CHoCH bekleniyor) arka planı hafifçe boya
+bgcolor(armed and not signal ? color.new(color.blue, 92) : na, title="Kurulu (CHoCH bekleniyor)")
+
+// TSI değer kutusu (sağ üst)
+var table t = table.new(position.top_right, 1, 2, border_width=1)
+if showTable and barstate.islast
+    table.cell(t, 0, 0, "TSI", text_color=color.white, bgcolor=color.new(color.gray, 20))
+    tsiCol = tsi_value < tsiThresh ? color.red : tsi_value > 0 ? color.green : color.orange
+    table.cell(t, 0, 1, str.tostring(tsi_value, "#.##"), text_color=color.white, bgcolor=color.new(tsiCol, 20))
+
+// ============ ALARM ============
+alertcondition(signal, title="TSI Oversold + Yukarı CHoCH", message="TSI {{ticker}} {{interval}}: Oversold (-35 altı) sonrası yukarı CHoCH kırılımı oluştu!")
